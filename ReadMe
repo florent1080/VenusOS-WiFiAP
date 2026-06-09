@@ -1,0 +1,51 @@
+VenusOS-WiFiAP
+==============
+
+WiFi Access Point with 4G internet sharing for Venus OS on Raspberry Pi 3.
+
+Creates a virtual ap0 interface on the BCM43438 chip and runs a full AP stack:
+hostapd (WPA2), dnsmasq (DHCP), iptables NAT toward wwan0 (4G modem).
+
+Compatible with VenusOS-E3372h (Huawei 4G modem package).
+
+## Requirements
+
+- Venus OS v3.50 or later
+- Raspberry Pi 3 (BCM43438 WiFi chip)
+- SetupHelper (kwindrem) installed
+- hostapd installed: `opkg install hostapd`
+- E3372h 4G modem connected on wwan0 (for internet sharing)
+
+## Installation
+
+Via SetupHelper PackageManager (recommended):
+  GitHub: florent1080/VenusOS-WiFiAP
+
+Manual:
+  cd /data/VenusOS-WiFiAP && bash setup install auto
+
+## Configuration
+
+Edit /data/wifi-ap/wifi-ap.conf :
+
+  SSID=ZeVan              # WiFi network name
+  PASSWORD=victron1234    # WPA2 password (8-63 chars)
+  CHANNEL=1               # WiFi channel (1-11)
+  AP_IP=192.168.0.1       # RPi3 gateway IP
+  UPSTREAM=wwan0          # Interface for internet sharing
+
+After editing: svc -t /service/wifi-ap
+
+## Connecting
+
+- Connect your device to WiFi "ZeVan" (or your custom SSID)
+- Your device gets IP 192.168.0.x via DHCP
+- Internet via 4G (wwan0) — shared with NAT
+- SSH to RPi3: ssh root@192.168.0.1
+
+## Notes
+
+- connman tethering is disabled on install (conflicts with ap0)
+- The native /service/hostapd is disabled (hostapd-run requires serial-number absent on DIY RPi3)
+- wifi-ap.conf is preserved on reinstall / Venus OS update
+- Logs: tail -f /var/log/wifi-ap/current

@@ -1,0 +1,32 @@
+#!/bin/sh
+# VenusOS-WiFiAP — runit finish script
+
+exec 2>&1
+echo "wifi-ap: stopping — cleaning up"
+
+CONF=/data/wifi-ap/wifi-ap.conf
+[ -f "$CONF" ] && . "$CONF"
+UPSTREAM="${UPSTREAM:-wwan0}"
+AP_IFACE="ap0"
+PID_DNS="/var/run/dnsmasq-ap0.pid"
+
+# Remove NAT rules
+iptables -t nat -D POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
+iptables -D FORWARD -i "$AP_IFACE" -o "$UPSTREAM" -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i "$UPSTREAM" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+# Stop dnsmasq instance used by AP service
+kill "$(cat "$PID_DNS" 2>/dev/null)" 2>/dev/null || true
+rm -f "$PID_DNS"
+
+# Remove virtual AP interface
+ip link set "$AP_IFACE" down 2>/dev/null || true
+iw dev "$AP_IFACE" del 2>/dev/null || true
+
+# Stop connman tethering
+connmanctl tether wifi off 2>/dev/null || true
+
+# Clean up extra dnsmasq config
+rm -f /var/run/connman/dnsmasq-wifi-ap.conf
+
+echo "wifi-ap: cleanup done"

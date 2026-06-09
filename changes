@@ -1,0 +1,15 @@
+v1.1
+- Fix: detect hostapd binary explicitly in service run script (/usr/sbin, /usr/bin, PATH)
+- Fix: clear error message when hostapd is missing, with install hint
+- Fix: cleanup FORWARD iptables rules on ap0 (not wlan0) in finish script
+- Fix: stop dnsmasq-ap0 and remove ap0 virtual interface during service stop
+- Improvement: setup now attempts to auto-install hostapd via opkg when missing
+
+v1.0
+- Initial release
+- WiFi AP on ap0 virtual interface (BCM43438 / RPi3)
+- Custom SSID + WPA2-PSK via wifi-ap.conf
+- dnsmasq DHCP for clients (192.168.0.100-200)
+- iptables NAT: ap0 → wwan0 (4G internet sharing)
+- Disables connman tethering (conflict with ap0)
+- Compatible SetupHelper (install/uninstall/reinstall)

@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# VenusOS-WiFiAP setup script
+# WiFi Access Point with NAT internet sharing for Venus OS (RPi3 BCM43438)
+#
+# This script installs/uninstalls:
+#   - wifi-ap.conf (default config, preserved on reinstall)
+#   - wifi-ap runit service (via SetupHelper INSTALL_SERVICES)
+#   - Disables connman tethering (which conflicts with ap0/hostapd)
+#   - Cleans up rc.local tethering/NAT fallback (replaced by the service)
+
+packageDir="$(dirname "$(realpath "$0")")"
+INSTALL_DIR="/data/wifi-ap"
+CONF_SRC="$packageDir/wifi-ap.conf"
+CONF_DST="$INSTALL_DIR/wifi-ap.conf"
+
+#### following line incorporates helper resources into this script
+source "/data/SetupHelper/HelperResources/IncludeHelpers"
+#### end of lines to include helper resources
+
+set +e
+
+#### running manually and target just install or uninstall
+if [ $scriptAction == 'NONE' ] ; then
+    echo
+    echo "This package creates a WiFi Access Point on Venus OS (RPi3)"
+    echo "Edit /data/wifi-ap/wifi-ap.conf to set SSID and password"
+    echo
+    scriptAction=$(promptForAction)
+fi
+
+# ─── INSTALL ─────────────────────────────────────────────────────────────────
+if [ $scriptAction == 'INSTALL' ] ; then
+    logMessage "installing VenusOS-WiFiAP"
+
+    # Ensure hostapd is present (required by /service/wifi-ap/run)
+    if ! command -v hostapd >/dev/null 2>&1 && [ ! -x /usr/sbin/hostapd ] && [ ! -x /usr/bin/hostapd ]; then
+        logMessage "hostapd not found, attempting install via opkg"
+        opkg update >/dev/null 2>&1 || true
+        if opkg install hostapd >/dev/null 2>&1; then
+            logMessage "hostapd installed"
+        else
+            logMessage "WARNING: unable to install hostapd automatically"
+            logMessage "Install manually: opkg update && opkg install hostapd"
+        fi
+    fi
+
+    # Create install directory
+    mkdir -p "$INSTALL_DIR"
+
+    # Install config (preserve existing user config)
+    if [ ! -f "$CONF_DST" ]; then
+        cp "$CONF_SRC" "$CONF_DST"
+        sed -i 's/\r//g' "$CONF_DST"
+        logMessage "default config installed: $CONF_DST"
+    else
+        logMessage "config already exists, preserved: $CONF_DST"
+    fi
+
+    # Enable connman tethering in settings (the service relies on this)
+    CONNMAN_SETTINGS="/data/var/lib/connman/settings"
+    if [ -f "$CONNMAN_SETTINGS" ]; then
+        sed -i 's/^Tethering=.*/Tethering=true/' "$CONNMAN_SETTINGS" 2>/dev/null || true
+        logMessage "connman settings updated (Tethering=true)"
+    fi
+
+    # Read SSID/PASSWORD from conf and push to connman settings
+    if [ -f "$CONF_DST" ]; then
+        source "$CONF_DST" 2>/dev/null || true
+        SSID="${SSID:-ZeVan}"
+        PASSWORD="${PASSWORD:-victron1234}"
+        if [ -f "$CONNMAN_SETTINGS" ]; then
+            if grep -q '^TetheringIdentifier=' "$CONNMAN_SETTINGS"; then
+                sed -i "s/^TetheringIdentifier=.*/TetheringIdentifier=$SSID/" "$CONNMAN_SETTINGS"
+            else
+                echo "TetheringIdentifier=$SSID" >> "$CONNMAN_SETTINGS"
+            fi
+
+            if grep -q '^TetheringPassphrase=' "$CONNMAN_SETTINGS"; then
+                sed -i "s/^TetheringPassphrase=.*/TetheringPassphrase=$PASSWORD/" "$CONNMAN_SETTINGS"
+            else
+                echo "TetheringPassphrase=$PASSWORD" >> "$CONNMAN_SETTINGS"
+            fi
+        fi
+        logMessage "connman tethering SSID=$SSID configured"
+    fi
+
+    # Activate tethering now (connman should be running)
+    logMessage "activating connman WiFi tethering"
+    connmanctl enable wifi 2>/dev/null || true
+    rfkill unblock wifi 2>/dev/null || true
+    sleep 3
+    connmanctl tether wifi on "${SSID:-ZeVan}" "${PASSWORD:-victron1234}" 2>/dev/null || true
+
+    # Disable native hostapd service (we use wifi-ap service instead)
+    # hostapd-run requires serial-number which is absent on DIY RPi3 builds
+    if [ -d /service/hostapd ] && [ ! -f /service/hostapd/down ]; then
+        touch /service/hostapd/down
+        svc -d /service/hostapd 2>/dev/null || true
+        logMessage "native hostapd service disabled (no serial-number on RPi3)"
+    fi
+
+    logMessage "VenusOS-WiFiAP install complete"
+    logMessage "NOTE: edit $CONF_DST to set SSID/password before starting"
+fi
+
+# ─── UNINSTALL ────────────────────────────────────────────────────────────────
+if [ $scriptAction == 'UNINSTALL' ] ; then
+    logMessage "uninstalling VenusOS-WiFiAP"
+
+    # Stop service and clean up interfaces
+    svc -d /service/wifi-ap 2>/dev/null || true
+    sleep 2
+    ip link delete ap0 2>/dev/null || true
+
+    # Note: wifi-ap.conf is preserved (user data)
+    logMessage "config preserved: $CONF_DST"
+    logMessage "VenusOS-WiFiAP uninstalled"
+fi
+
+# Let SetupHelper handle service install/uninstall
+endScript INSTALL_SERVICES
