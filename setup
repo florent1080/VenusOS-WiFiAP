@@ -107,15 +107,21 @@ if [ $scriptAction == 'INSTALL' ] ; then
 
     # --- Fix 3: cleanup leftover hostapd-native service (created by old package version).
     # Old versions placed the run script in services/hostapd-native/ which caused
-    # SetupHelper to install it as /service/hostapd-native, conflicting with
-    # the native /service/hostapd managed by venus-platform.
-    if [ -d /service/hostapd-native ]; then
-        svc -dx /service/hostapd-native/log 2>/dev/null || true
-        svc -dx /service/hostapd-native 2>/dev/null || true
-        sleep 2
-        rm -rf /service/hostapd-native
-        logMessage "removed legacy /service/hostapd-native"
-    fi
+    # SetupHelper to install it as /opt/victronenergy/service/hostapd-native (the
+    # persistent ext4 layer of the overlayfs mounted at /service/).
+    # Note: /service/ is an overlayfs overlay of /opt/victronenergy/service/ (ext4,
+    # persists across reboots) + /run/overlays/service/ (tmpfs, cleared at boot).
+    # Deleting only /service/hostapd-native only removes the overlay entry; the
+    # ext4 source persists and re-appears after reboot. Must delete from ext4 source.
+    for legacyDir in /opt/victronenergy/service/hostapd-native /run/overlays/service/hostapd-native; do
+        if [ -d "$legacyDir" ]; then
+            svc -dx /service/hostapd-native/log 2>/dev/null || true
+            svc -dx /service/hostapd-native 2>/dev/null || true
+            sleep 2
+            rm -rf "$legacyDir"
+            logMessage "removed legacy $legacyDir"
+        fi
+    done
 
     # --- Fix 4: enable AP via D-Bus settings.
     # venus-platform watches Settings/Services/AccessPoint; when set to 1 it
