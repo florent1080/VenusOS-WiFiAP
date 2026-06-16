@@ -105,7 +105,19 @@ if [ $scriptAction == 'INSTALL' ] ; then
         logMessage "WARNING: custom run script not found: $HOSTAPD_RUN_SRC"
     fi
 
-    # --- Fix 3: enable AP via D-Bus settings.
+    # --- Fix 3: cleanup leftover hostapd-native service (created by old package version).
+    # Old versions placed the run script in services/hostapd-native/ which caused
+    # SetupHelper to install it as /service/hostapd-native, conflicting with
+    # the native /service/hostapd managed by venus-platform.
+    if [ -d /service/hostapd-native ]; then
+        svc -dx /service/hostapd-native/log 2>/dev/null || true
+        svc -dx /service/hostapd-native 2>/dev/null || true
+        sleep 2
+        rm -rf /service/hostapd-native
+        logMessage "removed legacy /service/hostapd-native"
+    fi
+
+    # --- Fix 4: enable AP via D-Bus settings.
     # venus-platform watches Settings/Services/AccessPoint; when set to 1 it
     # calls svectl -s hostapd to create /run/service/hostapd from our patched
     # template, then runit starts the service automatically.
@@ -118,10 +130,13 @@ if [ $scriptAction == 'INSTALL' ] ; then
     fi
 
     # --- Restart venus-platform so it picks up the new serial-number.
-    # (venus-platform reads serial-number only at startup)
-    svc -t /service/venus-platform 2>/dev/null || true
-    sleep 5
-    logMessage "venus-platform restarted"
+    # Only done on manual install (not auto/boot) to avoid race with localsettings.
+    # At boot, venus-platform is started normally by runit and reads the setting.
+    if [ "$scriptAction" = 'INSTALL' ] && [ "${1:-}" != 'auto' ]; then
+        svc -t /service/venus-platform 2>/dev/null || true
+        sleep 5
+        logMessage "venus-platform restarted"
+    fi
 
     # Stop the wifi-ap placeholder service (it does nothing but runs in background)
     svc -d /service/wifi-ap 2>/dev/null || true
