@@ -22,7 +22,7 @@ packageDir="$(dirname "$(realpath "$0")")"
 INSTALL_DIR="/data/wifi-ap"
 CONF_SRC="$packageDir/wifi-ap.conf"
 CONF_DST="$INSTALL_DIR/wifi-ap.conf"
-HOSTAPD_RUN_SRC="$packageDir/services/hostapd-native/run"
+HOSTAPD_RUN_SRC="$packageDir/files/hostapd-template/run"
 TEMPLATE_RUN="/opt/victronenergy/service-templates/hostapd/run"
 TEMPLATE_BACKUP="$INSTALL_DIR/hostapd-template.orig"
 
