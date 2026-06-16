@@ -1,13 +1,14 @@
 #!/bin/sh
-# VenusOS-WiFiAP � runit service run script
+# VenusOS-WiFiAP - placeholder service (kept for SetupHelper compatibility)
 #
-# BCM43438 (brcmfmac) cannot do AP mode on the primary wlan0 interface.
-# connman tethering returns "Not supported" for the same reason.
-# Solution: create ap0 virtual AP interface while wlan0 is DOWN (releases PHY),
-# then run hostapd on ap0 in foreground (runit supervises).
-# Connman tries to bring wlan0 back up but fails (PHY busy) � expected.
-
+# WiFi AP is now managed by the native /service/hostapd service,
+# controlled via venus-platform: Settings > Connectivity > Access Point.
+# Toggle the AP from the Victron UI (Settings/Services/AccessPoint D-Bus setting).
+#
+# This service does nothing - it is a no-op kept so SetupHelper can track
+# the package status in /service/wifi-ap/.
 exec 2>&1
+exec sleep infinity
 
 # -- Load config --------------------------------------------------------------
 CONF=/data/wifi-ap/wifi-ap.conf

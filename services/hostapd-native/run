@@ -1,12 +1,12 @@
 #!/bin/sh
-# VenusOS-WiFiAP â€” replacement for /service/hostapd/run on RPi3 DIY
+# VenusOS-WiFiAP Ã¢â‚¬â€ replacement for /service/hostapd/run on RPi3 DIY
 #
 # Why: the native hostapd-run requires /data/venus/serial-number which is
-# absent on DIY RPi3 builds â†’ hostapd-run aborts â†’ venus-platform never
-# publishes /Services/AccessPoint/* D-Bus paths â†’ no AP section in UI.
+# absent on DIY RPi3 builds Ã¢â€ â€™ hostapd-run aborts Ã¢â€ â€™ venus-platform never
+# publishes /Services/AccessPoint/* D-Bus paths Ã¢â€ â€™ no AP section in UI.
 #
 # This script replaces /service/hostapd/run so the native supervise daemon
-# manages hostapd (â†’ venus-platform sees it and publishes AccessPoint D-Bus
+# manages hostapd (Ã¢â€ â€™ venus-platform sees it and publishes AccessPoint D-Bus
 # paths) while using our own SSID/PSK from wifi-ap.conf.
 
 exec 2>&1

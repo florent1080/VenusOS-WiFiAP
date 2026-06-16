@@ -3,20 +3,28 @@
 # VenusOS-WiFiAP setup script
 # WiFi Access Point with NAT internet sharing for Venus OS (RPi3 BCM43438)
 #
-# This script installs/uninstalls:
-#   - wifi-ap.conf (default config, preserved on reinstall)
-#   - Replaces /service/hostapd/run with a custom script that:
-#       * creates ap0 virtual interface (not done by native hostapd-run on RPi3)
-#       * writes /run/hostapd.conf with our SSID/PSK
-#       * sets up NAT and DHCP
-#       * runs hostapd in foreground (supervise manages it)
+# Architecture (v2):
 #   - Writes a dummy serial-number so venus-platform publishes
-#     /Services/AccessPoint/* D-Bus paths (needed for UI visibility)
+#     /Services/AccessPoint/* D-Bus paths (needed for UI AP toggle)
+#   - Patches the hostapd SERVICE TEMPLATE at:
+#       /opt/victronenergy/service-templates/hostapd/run
+#     with a custom script that creates ap0, configures networking,
+#     and runs hostapd with the SSID/PSK from wifi-ap.conf.
+#     (The ext4 rootfs on RPi3 is writable so this persists across reboots)
+#   - Enables the AP via D-Bus: Settings/Services/AccessPoint=1
+#     => venus-platform calls svectl to create/manage /service/hostapd
+#   - The services/wifi-ap/ service is kept as a placeholder (sleep infinity)
+#     for SetupHelper compatibility; actual AP work done by native hostapd.
+#
+# On uninstall: restores original template, disables AP setting.
 
 packageDir="$(dirname "$(realpath "$0")")"
 INSTALL_DIR="/data/wifi-ap"
 CONF_SRC="$packageDir/wifi-ap.conf"
 CONF_DST="$INSTALL_DIR/wifi-ap.conf"
+HOSTAPD_RUN_SRC="$packageDir/services/hostapd-native/run"
+TEMPLATE_RUN="/opt/victronenergy/service-templates/hostapd/run"
+TEMPLATE_BACKUP="$INSTALL_DIR/hostapd-template.orig"
 
 #### following line incorporates helper resources into this script
 source "/data/SetupHelper/HelperResources/IncludeHelpers"
@@ -28,6 +36,7 @@ set +e
 if [ $scriptAction == 'NONE' ] ; then
     echo
     echo "This package creates a WiFi Access Point on Venus OS (RPi3)"
+    echo "The AP appears in: Settings > Connectivity > Access Point"
     echo "Edit /data/wifi-ap/wifi-ap.conf to set SSID and password"
     echo
     scriptAction=$(promptForAction)
@@ -58,14 +67,13 @@ if [ $scriptAction == 'INSTALL' ] ; then
         logMessage "config already exists, preserved: $CONF_DST"
     fi
 
-    # --- Fix: write a dummy serial-number so venus-platform publishes
+    # --- Fix 1: write a dummy serial-number so venus-platform publishes
     # /Services/AccessPoint/* D-Bus paths on DIY RPi3 builds.
-    # On real Victron GX devices the serial is in EEPROM; on RPi3 DIY
-    # it is absent and hostapd-run aborts immediately, causing the UI AP
-    # section to never appear.
+    # On real Victron GX devices the serial is in EEPROM; on RPi3 DIY it is
+    # absent => venus-platform does not publish the AccessPoint UI section.
     SERIAL_FILE="/data/venus/serial-number"
     if [ ! -s "$SERIAL_FILE" ]; then
-        UNIQUE_ID="$(cat /data/venus/unique-id 2>/dev/null | tr -d '\n' | tr -d '\r' || true)"
+        UNIQUE_ID="$(cat /data/venus/unique-id 2>/dev/null | tr -d '\n\r' || true)"
         FAKE_SERIAL="RPi3-${UNIQUE_ID:-000000000000}"
         echo "$FAKE_SERIAL" > "$SERIAL_FILE"
         logMessage "wrote dummy serial-number: $FAKE_SERIAL"
@@ -73,68 +81,90 @@ if [ $scriptAction == 'INSTALL' ] ; then
         logMessage "serial-number already set: $(cat $SERIAL_FILE)"
     fi
 
-    # --- Replace /service/hostapd/run with our custom script.
-    # The native hostapd-run requires serial-number AND ap0 to already exist,
-    # and uses a fixed SSID format (venus-SERIAL-XXX) ignoring our config.
-    # Our replacement: creates ap0, configures networking, runs hostapd with
-    # the SSID/PSK from wifi-ap.conf.
-    # venus-platform monitors the native /service/hostapd supervise state and
-    # reads /run/hostapd.conf => publishes AccessPoint/* D-Bus paths => UI shows AP.
-    HOSTAPD_RUN_SRC="$packageDir/services/hostapd-native/run"
-    HOSTAPD_RUN_DST="/service/hostapd/run"
-    HOSTAPD_RUN_ORIG="$INSTALL_DIR/hostapd-run.orig"
-
-    if [ -f "$HOSTAPD_RUN_DST" ] && [ ! -f "$HOSTAPD_RUN_ORIG" ]; then
-        cp "$HOSTAPD_RUN_DST" "$HOSTAPD_RUN_ORIG"
-        logMessage "backed up original $HOSTAPD_RUN_DST -> $HOSTAPD_RUN_ORIG"
-    fi
-
+    # --- Fix 2: patch the hostapd service TEMPLATE so svectl installs our
+    # custom script instead of the stock hostapd-run.
+    # On RPi3, Venus OS runs from a writable ext4 filesystem (not squashfs),
+    # so the template at /opt/victronenergy/service-templates/hostapd/run
+    # is writable and the change persists across reboots.
+    # Our script: creates ap0 virtual interface, configures IP/NAT/DHCP,
+    # writes /run/hostapd.conf with custom SSID from wifi-ap.conf, runs hostapd.
     if [ -f "$HOSTAPD_RUN_SRC" ]; then
-        cp "$HOSTAPD_RUN_SRC" "$HOSTAPD_RUN_DST"
-        chmod +x "$HOSTAPD_RUN_DST"
-        logMessage "installed custom /service/hostapd/run"
+        if [ -f "$TEMPLATE_RUN" ]; then
+            if [ ! -f "$TEMPLATE_BACKUP" ]; then
+                cp "$TEMPLATE_RUN" "$TEMPLATE_BACKUP"
+                logMessage "backed up hostapd template -> $TEMPLATE_BACKUP"
+            fi
+            cp "$HOSTAPD_RUN_SRC" "$TEMPLATE_RUN"
+            chmod +x "$TEMPLATE_RUN"
+            logMessage "patched hostapd service template"
+        else
+            logMessage "WARNING: template not found: $TEMPLATE_RUN"
+            logMessage "AP may not work - native hostapd template missing"
+        fi
     else
-        logMessage "WARNING: $HOSTAPD_RUN_SRC not found"
+        logMessage "WARNING: custom run script not found: $HOSTAPD_RUN_SRC"
     fi
 
-    # Stop any stale wifi-ap custom service and enable native hostapd
+    # --- Fix 3: enable AP via D-Bus settings.
+    # venus-platform watches Settings/Services/AccessPoint; when set to 1 it
+    # calls svectl -s hostapd to create /run/service/hostapd from our patched
+    # template, then runit starts the service automatically.
+    AP_SETTING=$(dbus -y com.victronenergy.settings /Settings/Services/AccessPoint GetValue 2>/dev/null | grep -o '[0-9]*' || echo "")
+    if [ "$AP_SETTING" != "1" ]; then
+        dbus -y com.victronenergy.settings /Settings/Services/AccessPoint SetValue 1 2>/dev/null || true
+        logMessage "enabled AP: Settings/Services/AccessPoint=1"
+    else
+        logMessage "AP already enabled (Settings/Services/AccessPoint=1)"
+    fi
+
+    # --- Restart venus-platform so it picks up the new serial-number.
+    # (venus-platform reads serial-number only at startup)
+    svc -t /service/venus-platform 2>/dev/null || true
+    sleep 5
+    logMessage "venus-platform restarted"
+
+    # Stop the wifi-ap placeholder service (it does nothing but runs in background)
     svc -d /service/wifi-ap 2>/dev/null || true
-    rm -f /service/hostapd/down 2>/dev/null || true
-    svc -u /service/hostapd 2>/dev/null || true
-    logMessage "native hostapd service enabled"
 
     logMessage "VenusOS-WiFiAP install complete"
-    logMessage "AP SSID and password read from $CONF_DST"
+    logMessage "AP SSID/password: edit $CONF_DST"
+    logMessage "Toggle AP in UI: Settings > Connectivity > Access Point"
 fi
 
 # --- UNINSTALL ---------------------------------------------------------------
 if [ $scriptAction == 'UNINSTALL' ] ; then
     logMessage "uninstalling VenusOS-WiFiAP"
 
-    # Stop native hostapd and restore original run script
-    svc -d /service/hostapd 2>/dev/null || true
-    touch /service/hostapd/down
-    HOSTAPD_RUN_ORIG="$INSTALL_DIR/hostapd-run.orig"
-    if [ -f "$HOSTAPD_RUN_ORIG" ]; then
-        cp "$HOSTAPD_RUN_ORIG" /service/hostapd/run
-        chmod +x /service/hostapd/run
-        logMessage "original /service/hostapd/run restored"
+    # Disable AP via D-Bus settings (venus-platform removes /service/hostapd)
+    dbus -y com.victronenergy.settings /Settings/Services/AccessPoint SetValue 0 2>/dev/null || true
+    logMessage "disabled AP: Settings/Services/AccessPoint=0"
+
+    # Restore original hostapd service template
+    if [ -f "$TEMPLATE_BACKUP" ]; then
+        cp "$TEMPLATE_BACKUP" "$TEMPLATE_RUN"
+        chmod +x "$TEMPLATE_RUN"
+        rm -f "$TEMPLATE_BACKUP"
+        logMessage "restored original hostapd template"
     fi
 
-    # Clean up ap0 interface, NAT, DHCP
+    # Clean up any remaining ap0 interface, NAT rules, DHCP
     ip link set ap0 down 2>/dev/null || true
     iw dev ap0 del 2>/dev/null || true
     kill "$(cat /var/run/dnsmasq-ap0.pid 2>/dev/null)" 2>/dev/null || true
-    UPSTREAM_CONF="$(grep '^UPSTREAM=' "$CONF_DST" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'" || echo wwan0)"
-    UPSTREAM="${UPSTREAM_CONF:-wwan0}"
+    UPSTREAM="$(grep '^UPSTREAM=' "$CONF_DST" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")"
+    UPSTREAM="${UPSTREAM:-wwan0}"
     iptables -t nat -D POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
     iptables -D FORWARD -i ap0 -o "$UPSTREAM" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "$UPSTREAM" -o ap0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+    # Restart venus-platform to clear serial-number from D-Bus (optional)
+    # Note: /data/venus/serial-number is kept (user may want it for other purposes)
+    svc -t /service/venus-platform 2>/dev/null || true
 
     # wifi-ap.conf preserved (user data)
     logMessage "config preserved: $CONF_DST"
     logMessage "VenusOS-WiFiAP uninstalled"
 fi
 
-# Let SetupHelper handle service install/uninstall for wifi-ap
+# Install services/wifi-ap placeholder (no-op sleep, for SetupHelper tracking)
 endScript INSTALL_SERVICES
