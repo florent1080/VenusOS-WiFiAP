@@ -29,9 +29,14 @@ if [ $scriptAction == 'NONE' ] ; then
     scriptAction=$(promptForAction)
 fi
 
-# ─── INSTALL ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€ INSTALL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if [ $scriptAction == 'INSTALL' ] ; then
     logMessage "installing VenusOS-WiFiAP"
+
+    # Keep service scripts executable in packageDir (archives on Windows can drop +x)
+    chmod +x "$packageDir/services/wifi-ap/run" 2>/dev/null || true
+    chmod +x "$packageDir/services/wifi-ap/finish" 2>/dev/null || true
+    chmod +x "$packageDir/services/wifi-ap/log/run" 2>/dev/null || true
 
     # Ensure hostapd is present (required by /service/wifi-ap/run)
     if ! command -v hostapd >/dev/null 2>&1 && [ ! -x /usr/sbin/hostapd ] && [ ! -x /usr/bin/hostapd ]; then
@@ -102,9 +107,17 @@ if [ $scriptAction == 'INSTALL' ] ; then
 
     logMessage "VenusOS-WiFiAP install complete"
     logMessage "NOTE: edit $CONF_DST to set SSID/password before starting"
+
+    # SetupHelper can recreate /service scripts without +x on some systems.
+    # Apply chmod shortly after service installation and restart the service once.
+    (
+        sleep 2
+        chmod +x /service/wifi-ap/run /service/wifi-ap/finish /service/wifi-ap/log/run 2>/dev/null || true
+        svc -t /service/wifi-ap 2>/dev/null || true
+    ) &
 fi
 
-# ─── UNINSTALL ────────────────────────────────────────────────────────────────
+# â”€â”€â”€ UNINSTALL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if [ $scriptAction == 'UNINSTALL' ] ; then
     logMessage "uninstalling VenusOS-WiFiAP"
 
