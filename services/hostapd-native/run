@@ -1,0 +1,99 @@
+#!/bin/sh
+# VenusOS-WiFiAP â€” replacement for /service/hostapd/run on RPi3 DIY
+#
+# Why: the native hostapd-run requires /data/venus/serial-number which is
+# absent on DIY RPi3 builds â†’ hostapd-run aborts â†’ venus-platform never
+# publishes /Services/AccessPoint/* D-Bus paths â†’ no AP section in UI.
+#
+# This script replaces /service/hostapd/run so the native supervise daemon
+# manages hostapd (â†’ venus-platform sees it and publishes AccessPoint D-Bus
+# paths) while using our own SSID/PSK from wifi-ap.conf.
+
+exec 2>&1
+
+CONF=/data/wifi-ap/wifi-ap.conf
+[ -f "$CONF" ] && . "$CONF"
+
+SSID="${SSID:-ZeVan}"
+PASSWORD="${PASSWORD:-victron1234}"
+CHANNEL="${CHANNEL:-1}"
+AP_IP="${AP_IP:-192.168.0.1}"
+DHCP_START="${DHCP_START:-192.168.0.100}"
+DHCP_END="${DHCP_END:-192.168.0.200}"
+DHCP_LEASE="${DHCP_LEASE:-2m}"
+UPSTREAM="${UPSTREAM:-wwan0}"
+IFACE="wlan0"
+AP_IFACE="ap0"
+
+echo "wifi-ap(hostapd): starting SSID=$SSID channel=$CHANNEL IP=$AP_IP"
+
+# -- Unblock WiFi ---------------------------------------------------------
+rfkill unblock wifi 2>/dev/null || true
+
+# -- Clean up previous ap0 state ------------------------------------------
+ip link set "$AP_IFACE" down 2>/dev/null || true
+iw dev "$AP_IFACE" del 2>/dev/null || true
+sleep 1
+
+# -- Bring wlan0 down to release PHY so ap0 can be created ----------------
+ip link set "$IFACE" down 2>/dev/null || true
+sleep 1
+
+# -- Create virtual AP interface ------------------------------------------
+if ! iw dev "$IFACE" interface add "$AP_IFACE" type __ap; then
+    echo "wifi-ap(hostapd): ERROR - failed to create $AP_IFACE, retry in 10s"
+    sleep 10
+    exit 1
+fi
+ip link set "$AP_IFACE" up
+ip addr flush dev "$AP_IFACE" 2>/dev/null || true
+ip addr add "$AP_IP/24" dev "$AP_IFACE"
+echo "wifi-ap(hostapd): $AP_IFACE up, IP $AP_IP"
+
+# -- Write hostapd config (venus-platform reads ssid= from here) ----------
+cat > /run/hostapd.conf <<EOF
+interface=$AP_IFACE
+driver=nl80211
+ssid=$SSID
+hw_mode=g
+channel=$CHANNEL
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_passphrase=$PASSWORD
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+ctrl_interface=/var/run/hostapd
+ctrl_interface_group=0
+wpa_ptk_rekey=3600
+EOF
+echo "wifi-ap(hostapd): /run/hostapd.conf written (ssid=$SSID)"
+
+# -- Enable NAT -----------------------------------------------------------
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -D POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
+iptables -D FORWARD -i "$AP_IFACE" -o "$UPSTREAM" -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i "$UPSTREAM" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+iptables -t nat -A POSTROUTING -o "$UPSTREAM" -j MASQUERADE
+iptables -A FORWARD -i "$AP_IFACE" -o "$UPSTREAM" -j ACCEPT
+iptables -A FORWARD -i "$UPSTREAM" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+echo "wifi-ap(hostapd): NAT $AP_IFACE -> $UPSTREAM enabled"
+
+# -- Start dnsmasq DHCP ---------------------------------------------------
+PID_DNS=/var/run/dnsmasq-ap0.pid
+kill "$(cat $PID_DNS 2>/dev/null)" 2>/dev/null || true
+dnsmasq \
+    --interface="$AP_IFACE" \
+    --bind-interfaces \
+    --dhcp-range="$DHCP_START,$DHCP_END,$DHCP_LEASE" \
+    --dhcp-option=3,"$AP_IP" \
+    --dhcp-option=6,8.8.8.8,8.8.4.4 \
+    --no-resolv \
+    --port=0 \
+    --pid-file="$PID_DNS" 2>&1 || true
+echo "wifi-ap(hostapd): dnsmasq DHCP $DHCP_START-$DHCP_END started"
+
+# -- Launch hostapd (foreground, supervise manages restart) ---------------
+echo "wifi-ap(hostapd): launching /usr/sbin/hostapd"
+exec /usr/sbin/hostapd /run/hostapd.conf

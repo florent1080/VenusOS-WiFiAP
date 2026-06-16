@@ -5,9 +5,13 @@
 #
 # This script installs/uninstalls:
 #   - wifi-ap.conf (default config, preserved on reinstall)
-#   - wifi-ap runit service (via SetupHelper INSTALL_SERVICES)
-#   - Disables connman tethering (which conflicts with ap0/hostapd)
-#   - Cleans up rc.local tethering/NAT fallback (replaced by the service)
+#   - Replaces /service/hostapd/run with a custom script that:
+#       * creates ap0 virtual interface (not done by native hostapd-run on RPi3)
+#       * writes /run/hostapd.conf with our SSID/PSK
+#       * sets up NAT and DHCP
+#       * runs hostapd in foreground (supervise manages it)
+#   - Writes a dummy serial-number so venus-platform publishes
+#     /Services/AccessPoint/* D-Bus paths (needed for UI visibility)
 
 packageDir="$(dirname "$(realpath "$0")")"
 INSTALL_DIR="/data/wifi-ap"
@@ -29,16 +33,11 @@ if [ $scriptAction == 'NONE' ] ; then
     scriptAction=$(promptForAction)
 fi
 
-# â”€â”€â”€ INSTALL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- INSTALL -----------------------------------------------------------------
 if [ $scriptAction == 'INSTALL' ] ; then
     logMessage "installing VenusOS-WiFiAP"
 
-    # Keep service scripts executable in packageDir (archives on Windows can drop +x)
-    chmod +x "$packageDir/services/wifi-ap/run" 2>/dev/null || true
-    chmod +x "$packageDir/services/wifi-ap/finish" 2>/dev/null || true
-    chmod +x "$packageDir/services/wifi-ap/log/run" 2>/dev/null || true
-
-    # Ensure hostapd is present (required by /service/wifi-ap/run)
+    # Ensure hostapd binary is present
     if ! command -v hostapd >/dev/null 2>&1 && [ ! -x /usr/sbin/hostapd ] && [ ! -x /usr/bin/hostapd ]; then
         logMessage "hostapd not found, attempting install via opkg"
         opkg update >/dev/null 2>&1 || true
@@ -50,86 +49,92 @@ if [ $scriptAction == 'INSTALL' ] ; then
         fi
     fi
 
-    # Create install directory
+    # Create install directory and install config (preserve existing)
     mkdir -p "$INSTALL_DIR"
-
-    # Install config (preserve existing user config)
     if [ ! -f "$CONF_DST" ]; then
         cp "$CONF_SRC" "$CONF_DST"
-        sed -i 's/\r//g' "$CONF_DST"
         logMessage "default config installed: $CONF_DST"
     else
         logMessage "config already exists, preserved: $CONF_DST"
     fi
 
-    # Enable connman tethering in settings (the service relies on this)
-    CONNMAN_SETTINGS="/data/var/lib/connman/settings"
-    if [ -f "$CONNMAN_SETTINGS" ]; then
-        sed -i 's/^Tethering=.*/Tethering=true/' "$CONNMAN_SETTINGS" 2>/dev/null || true
-        logMessage "connman settings updated (Tethering=true)"
+    # --- Fix: write a dummy serial-number so venus-platform publishes
+    # /Services/AccessPoint/* D-Bus paths on DIY RPi3 builds.
+    # On real Victron GX devices the serial is in EEPROM; on RPi3 DIY
+    # it is absent and hostapd-run aborts immediately, causing the UI AP
+    # section to never appear.
+    SERIAL_FILE="/data/venus/serial-number"
+    if [ ! -s "$SERIAL_FILE" ]; then
+        UNIQUE_ID="$(cat /data/venus/unique-id 2>/dev/null | tr -d '\n' | tr -d '\r' || true)"
+        FAKE_SERIAL="RPi3-${UNIQUE_ID:-000000000000}"
+        echo "$FAKE_SERIAL" > "$SERIAL_FILE"
+        logMessage "wrote dummy serial-number: $FAKE_SERIAL"
+    else
+        logMessage "serial-number already set: $(cat $SERIAL_FILE)"
     fi
 
-    # Read SSID/PASSWORD from conf and push to connman settings
-    if [ -f "$CONF_DST" ]; then
-        source "$CONF_DST" 2>/dev/null || true
-        SSID="${SSID:-ZeVan}"
-        PASSWORD="${PASSWORD:-victron1234}"
-        if [ -f "$CONNMAN_SETTINGS" ]; then
-            if grep -q '^TetheringIdentifier=' "$CONNMAN_SETTINGS"; then
-                sed -i "s/^TetheringIdentifier=.*/TetheringIdentifier=$SSID/" "$CONNMAN_SETTINGS"
-            else
-                echo "TetheringIdentifier=$SSID" >> "$CONNMAN_SETTINGS"
-            fi
+    # --- Replace /service/hostapd/run with our custom script.
+    # The native hostapd-run requires serial-number AND ap0 to already exist,
+    # and uses a fixed SSID format (venus-SERIAL-XXX) ignoring our config.
+    # Our replacement: creates ap0, configures networking, runs hostapd with
+    # the SSID/PSK from wifi-ap.conf.
+    # venus-platform monitors the native /service/hostapd supervise state and
+    # reads /run/hostapd.conf => publishes AccessPoint/* D-Bus paths => UI shows AP.
+    HOSTAPD_RUN_SRC="$packageDir/services/hostapd-native/run"
+    HOSTAPD_RUN_DST="/service/hostapd/run"
+    HOSTAPD_RUN_ORIG="$INSTALL_DIR/hostapd-run.orig"
 
-            if grep -q '^TetheringPassphrase=' "$CONNMAN_SETTINGS"; then
-                sed -i "s/^TetheringPassphrase=.*/TetheringPassphrase=$PASSWORD/" "$CONNMAN_SETTINGS"
-            else
-                echo "TetheringPassphrase=$PASSWORD" >> "$CONNMAN_SETTINGS"
-            fi
-        fi
-        logMessage "connman tethering SSID=$SSID configured"
+    if [ -f "$HOSTAPD_RUN_DST" ] && [ ! -f "$HOSTAPD_RUN_ORIG" ]; then
+        cp "$HOSTAPD_RUN_DST" "$HOSTAPD_RUN_ORIG"
+        logMessage "backed up original $HOSTAPD_RUN_DST -> $HOSTAPD_RUN_ORIG"
     fi
 
-    # Activate tethering now (connman should be running)
-    logMessage "activating connman WiFi tethering"
-    connmanctl enable wifi 2>/dev/null || true
-    rfkill unblock wifi 2>/dev/null || true
-    sleep 3
-    connmanctl tether wifi on "${SSID:-ZeVan}" "${PASSWORD:-victron1234}" 2>/dev/null || true
-
-    # Disable native hostapd service (we use wifi-ap service instead)
-    # hostapd-run requires serial-number which is absent on DIY RPi3 builds
-    if [ -d /service/hostapd ] && [ ! -f /service/hostapd/down ]; then
-        touch /service/hostapd/down
-        svc -d /service/hostapd 2>/dev/null || true
-        logMessage "native hostapd service disabled (no serial-number on RPi3)"
+    if [ -f "$HOSTAPD_RUN_SRC" ]; then
+        cp "$HOSTAPD_RUN_SRC" "$HOSTAPD_RUN_DST"
+        chmod +x "$HOSTAPD_RUN_DST"
+        logMessage "installed custom /service/hostapd/run"
+    else
+        logMessage "WARNING: $HOSTAPD_RUN_SRC not found"
     fi
+
+    # Stop any stale wifi-ap custom service and enable native hostapd
+    svc -d /service/wifi-ap 2>/dev/null || true
+    rm -f /service/hostapd/down 2>/dev/null || true
+    svc -u /service/hostapd 2>/dev/null || true
+    logMessage "native hostapd service enabled"
 
     logMessage "VenusOS-WiFiAP install complete"
-    logMessage "NOTE: edit $CONF_DST to set SSID/password before starting"
-
-    # SetupHelper can recreate /service scripts without +x on some systems.
-    # Apply chmod shortly after service installation and restart the service once.
-    (
-        sleep 2
-        chmod +x /service/wifi-ap/run /service/wifi-ap/finish /service/wifi-ap/log/run 2>/dev/null || true
-        svc -t /service/wifi-ap 2>/dev/null || true
-    ) &
+    logMessage "AP SSID and password read from $CONF_DST"
 fi
 
-# â”€â”€â”€ UNINSTALL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- UNINSTALL ---------------------------------------------------------------
 if [ $scriptAction == 'UNINSTALL' ] ; then
     logMessage "uninstalling VenusOS-WiFiAP"
 
-    # Stop service and clean up interfaces
-    svc -d /service/wifi-ap 2>/dev/null || true
-    sleep 2
-    ip link delete ap0 2>/dev/null || true
+    # Stop native hostapd and restore original run script
+    svc -d /service/hostapd 2>/dev/null || true
+    touch /service/hostapd/down
+    HOSTAPD_RUN_ORIG="$INSTALL_DIR/hostapd-run.orig"
+    if [ -f "$HOSTAPD_RUN_ORIG" ]; then
+        cp "$HOSTAPD_RUN_ORIG" /service/hostapd/run
+        chmod +x /service/hostapd/run
+        logMessage "original /service/hostapd/run restored"
+    fi
 
-    # Note: wifi-ap.conf is preserved (user data)
+    # Clean up ap0 interface, NAT, DHCP
+    ip link set ap0 down 2>/dev/null || true
+    iw dev ap0 del 2>/dev/null || true
+    kill "$(cat /var/run/dnsmasq-ap0.pid 2>/dev/null)" 2>/dev/null || true
+    UPSTREAM_CONF="$(grep '^UPSTREAM=' "$CONF_DST" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'" || echo wwan0)"
+    UPSTREAM="${UPSTREAM_CONF:-wwan0}"
+    iptables -t nat -D POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i ap0 -o "$UPSTREAM" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$UPSTREAM" -o ap0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+    # wifi-ap.conf preserved (user data)
     logMessage "config preserved: $CONF_DST"
     logMessage "VenusOS-WiFiAP uninstalled"
 fi
 
-# Let SetupHelper handle service install/uninstall
+# Let SetupHelper handle service install/uninstall for wifi-ap
 endScript INSTALL_SERVICES
