@@ -62,6 +62,7 @@ if [ $scriptAction == 'INSTALL' ] ; then
     mkdir -p "$INSTALL_DIR"
     if [ ! -f "$CONF_DST" ]; then
         cp "$CONF_SRC" "$CONF_DST"
+        sed -i 's/\r//g' "$CONF_DST"
         logMessage "default config installed: $CONF_DST"
     else
         logMessage "config already exists, preserved: $CONF_DST"
@@ -95,6 +96,9 @@ if [ $scriptAction == 'INSTALL' ] ; then
                 logMessage "backed up hostapd template -> $TEMPLATE_BACKUP"
             fi
             cp "$HOSTAPD_RUN_SRC" "$TEMPLATE_RUN"
+            # Strip CR in case the package was copied from Windows (CRLF breaks
+            # the shebang on BusyBox: "bad interpreter: /bin/sh^M")
+            sed -i 's/\r//g' "$TEMPLATE_RUN"
             chmod +x "$TEMPLATE_RUN"
             logMessage "patched hostapd service template"
         else

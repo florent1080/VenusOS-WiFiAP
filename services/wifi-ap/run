@@ -1,4 +1,4 @@
-﻿#!/bin/sh
+#!/bin/sh
 # VenusOS-WiFiAP - placeholder service (kept for SetupHelper compatibility)
 #
 # WiFi AP is now managed by the native /service/hostapd service,
