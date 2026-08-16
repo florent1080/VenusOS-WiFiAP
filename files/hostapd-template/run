@@ -1,12 +1,12 @@
 #!/bin/sh
-# VenusOS-WiFiAP Ã¢â‚¬â€ replacement for /service/hostapd/run on RPi3 DIY
+# VenusOS-WiFiAP - replacement for /service/hostapd/run on RPi3 DIY
 #
 # Why: the native hostapd-run requires /data/venus/serial-number which is
-# absent on DIY RPi3 builds Ã¢â€ â€™ hostapd-run aborts Ã¢â€ â€™ venus-platform never
-# publishes /Services/AccessPoint/* D-Bus paths Ã¢â€ â€™ no AP section in UI.
+# absent on DIY RPi3 builds -> hostapd-run aborts -> venus-platform never
+# publishes /Services/AccessPoint/* D-Bus paths -> no AP section in UI.
 #
 # This script replaces /service/hostapd/run so the native supervise daemon
-# manages hostapd (Ã¢â€ â€™ venus-platform sees it and publishes AccessPoint D-Bus
+# manages hostapd (-> venus-platform sees it and publishes AccessPoint D-Bus
 # paths) while using our own SSID/PSK from wifi-ap.conf.
 
 exec 2>&1
@@ -20,7 +20,7 @@ CHANNEL="${CHANNEL:-1}"
 AP_IP="${AP_IP:-192.168.0.1}"
 DHCP_START="${DHCP_START:-192.168.0.100}"
 DHCP_END="${DHCP_END:-192.168.0.200}"
-DHCP_LEASE="${DHCP_LEASE:-2m}"
+DHCP_LEASE="${DHCP_LEASE:-12h}"
 UPSTREAM="${UPSTREAM:-wwan0}"
 IFACE="wlan0"
 AP_IFACE="ap0"
@@ -71,14 +71,34 @@ EOF
 echo "wifi-ap(hostapd): /run/hostapd.conf written (ssid=$SSID)"
 
 # -- Enable NAT -----------------------------------------------------------
+AP_NET="$(echo "$AP_IP" | cut -d. -f1-3).0/24"
+
 echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Drop our previous rules. The unscoped POSTROUTING form is deleted too, so
+# upgrading from a version that masqueraded everything leaving $UPSTREAM does
+# not leave a duplicate rule behind.
 iptables -t nat -D POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
+iptables -t nat -D POSTROUTING -s "$AP_NET" -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
 iptables -D FORWARD -i "$AP_IFACE" -o "$UPSTREAM" -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i "$UPSTREAM" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-iptables -t nat -A POSTROUTING -o "$UPSTREAM" -j MASQUERADE
+iptables -t mangle -D FORWARD -o "$UPSTREAM" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+# Masquerade only the AP subnet: traffic the GX originates itself already
+# leaves with the upstream address and has no business going through NAT.
+iptables -t nat -A POSTROUTING -s "$AP_NET" -o "$UPSTREAM" -j MASQUERADE
 iptables -A FORWARD -i "$AP_IFACE" -o "$UPSTREAM" -j ACCEPT
 iptables -A FORWARD -i "$UPSTREAM" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
-echo "wifi-ap(hostapd): NAT $AP_IFACE -> $UPSTREAM enabled"
+echo "wifi-ap(hostapd): NAT $AP_NET -> $UPSTREAM enabled"
+
+# Clamp TCP MSS to the path MTU. A cellular upstream is rarely 1500 (an NCM
+# link is typically 1450), and without this clients hit a PMTU black hole:
+# small requests work, larger responses never arrive.
+if iptables -t mangle -A FORWARD -o "$UPSTREAM" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+    echo "wifi-ap(hostapd): TCP MSS clamped to path MTU on $UPSTREAM"
+else
+    echo "wifi-ap(hostapd): WARNING - TCPMSS target unavailable, clients may hit PMTU black holes"
+fi
 
 # -- Start dnsmasq DHCP ---------------------------------------------------
 PID_DNS=/var/run/dnsmasq-ap0.pid
