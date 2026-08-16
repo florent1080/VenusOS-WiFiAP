@@ -1,4 +1,4 @@
-﻿#!/bin/sh
+#!/bin/sh
 # VenusOS-WiFiAP - placeholder service (kept for SetupHelper compatibility)
 #
 # WiFi AP is now managed by the native /service/hostapd service,
@@ -7,5 +7,14 @@
 #
 # This service does nothing - it is a no-op kept so SetupHelper can track
 # the package status in /service/wifi-ap/.
+#
+# Two things this file must not do again:
+#  - carry a UTF-8 BOM. The kernel needs "#!" at offset 0, so a BOM makes the
+#    shebang invalid and runsv cannot exec this script.
+#  - use "sleep infinity". That is a GNU coreutils extension; the BusyBox
+#    sleep on Venus OS rejects the argument and exits immediately.
+# Either one turns this no-op into a service runsv restarts once a second.
 exec 2>&1
-exec sleep infinity
+while true; do
+    sleep 3600
+done

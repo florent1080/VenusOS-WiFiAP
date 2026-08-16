@@ -1,3 +1,23 @@
+v1.2
+- Fix: services/wifi-ap/run carried a UTF-8 BOM, so the kernel did not see a
+  valid shebang and runsv could not exec it. Combined with "sleep infinity"
+  (a GNU extension BusyBox sleep rejects), the no-op service was restarted
+  once a second forever.
+- Fix: removed services/wifi-ap/finish. It dated from v1, when this service
+  owned the AP. Since v2 the AP belongs to /service/hostapd, but finish still
+  deleted ap0, killed dnsmasq and removed the NAT rules on every stop of the
+  no-op service - tearing down a live AP owned by another service. setup now
+  deletes it from installs that already have it.
+- Fix: clamp TCP MSS to the path MTU on the upstream interface. A cellular
+  upstream is typically MTU 1450; without this, clients hit PMTU black holes
+  where small requests work and larger responses never arrive.
+- Improvement: MASQUERADE is now scoped to the AP subnet instead of every
+  packet leaving the upstream interface. The old unscoped rule is deleted on
+  start and on uninstall, so upgrading leaves no duplicate.
+- Improvement: default DHCP lease raised from 2m to 12h. Existing
+  wifi-ap.conf files are preserved and keep their current value.
+- Cleanup: repaired mojibake in the hostapd template comments.
+
 v1.1
 - Fix: detect hostapd binary explicitly in service run script (/usr/sbin, /usr/bin, PATH)
 - Fix: clear error message when hostapd is missing, with install hint
@@ -10,6 +30,6 @@ v1.0
 - WiFi AP on ap0 virtual interface (BCM43438 / RPi3)
 - Custom SSID + WPA2-PSK via wifi-ap.conf
 - dnsmasq DHCP for clients (192.168.0.100-200)
-- iptables NAT: ap0 → wwan0 (4G internet sharing)
+- iptables NAT: ap0 -> wwan0 (4G internet sharing)
 - Disables connman tethering (conflict with ap0)
 - Compatible SetupHelper (install/uninstall/reinstall)
