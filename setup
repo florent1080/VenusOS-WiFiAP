@@ -127,7 +127,19 @@ if [ $scriptAction == 'INSTALL' ] ; then
         fi
     done
 
-    # --- Fix 4: enable AP via D-Bus settings.
+    # --- Fix 5: drop the obsolete wifi-ap finish script.
+    # It dates from v1, when /service/wifi-ap owned the AP. Since v2 the AP
+    # belongs to /service/hostapd, but finish still deleted ap0, killed
+    # dnsmasq and removed the NAT rules - resources owned by another service.
+    # Any runsv restart of this no-op service would tear the live AP down.
+    for svcDir in /service/wifi-ap /opt/victronenergy/service/wifi-ap /run/overlays/service/wifi-ap ; do
+        if [ -f "$svcDir/finish" ]; then
+            rm -f "$svcDir/finish"
+            logMessage "removed obsolete $svcDir/finish"
+        fi
+    done
+
+    # --- Fix 6: enable AP via D-Bus settings.
     # venus-platform watches Settings/Services/AccessPoint; when set to 1 it
     # calls svectl -s hostapd to create /run/service/hostapd from our patched
     # template, then runit starts the service automatically.
@@ -178,9 +190,14 @@ if [ $scriptAction == 'UNINSTALL' ] ; then
     kill "$(cat /var/run/dnsmasq-ap0.pid 2>/dev/null)" 2>/dev/null || true
     UPSTREAM="$(grep '^UPSTREAM=' "$CONF_DST" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")"
     UPSTREAM="${UPSTREAM:-wwan0}"
+    AP_IP="$(grep '^AP_IP=' "$CONF_DST" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")"
+    AP_IP="${AP_IP:-192.168.0.1}"
+    AP_NET="$(echo "$AP_IP" | cut -d. -f1-3).0/24"
     iptables -t nat -D POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -s "$AP_NET" -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
     iptables -D FORWARD -i ap0 -o "$UPSTREAM" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "$UPSTREAM" -o ap0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -t mangle -D FORWARD -o "$UPSTREAM" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
     # Restart venus-platform to clear serial-number from D-Bus (optional)
     # Note: /data/venus/serial-number is kept (user may want it for other purposes)
