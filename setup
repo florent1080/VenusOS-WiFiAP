@@ -71,6 +71,9 @@ if [ $scriptAction == 'INSTALL' ] ; then
     # "bad interpreter: /bin/sh^M" on BusyBox.
     sed -i 's/\r//g' "$ENGINE" "$TEMPLATE_RUN_SRC" "$TEMPLATE_LOG_SRC"
     chmod +x "$ENGINE"
+    # a GitHub download loses the execute bits; SetupHelper copies services
+    # as-is, so make sure the watchdog scripts are executable before endScript
+    find "$packageDir/services" -name run -exec sed -i 's/\r//g' {} \; -exec chmod +x {} \; 2>/dev/null
 
     # --- Install the hostapd service template.
     # If the image shipped a native template (Cerbo-like images), back up its
