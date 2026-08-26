@@ -1,0 +1,362 @@
+#!/bin/sh
+# VenusOS-WiFiAP v2 - AP engine, run by /service/hostapd (venus-platform/svectl)
+#
+# Implements the Cerbo GX-style access point on Venus OS Raspberry Pi images
+# that ship neither hostapd nor the native hostapd service template.
+# The AP runs on a virtual ap0 interface NEXT TO the wlan0 station
+# (concurrent STA+AP, validated on Pi 5 / BCM43455 / Venus 3.75), using the
+# image's wpa_supplicant which is built with CONFIG_AP - no hostapd needed.
+#
+# Control flow (all native Victron mechanics, same as a Cerbo GX):
+#   UI toggle "Create access point"
+#     -> com.victronenergy.platform /Services/AccessPoint/Enabled
+#     -> /Settings/Services/AccessPoint (localsettings)
+#     -> venus-platform DaemonToolsService -> svectl -s hostapd
+#     -> /service/hostapd -> template run -> this script.
+# A password change on /Settings/Services/AccessPointPassword makes
+# venus-platform restart the service (svc -t), which regenerates the
+# configuration here.
+#
+# Channel policy (single radio, iw: "#{ managed } <= 1, #{ AP } <= 1"):
+#   - station associated on a non-DFS channel AT STARTUP -> AP takes that
+#     channel; otherwise CHANNEL from wifi-ap.conf (2.4 GHz fallback).
+#   - The channel is chosen at startup ONLY, like Victron's own AP. Chasing
+#     the station afterwards means deleting/recreating ap0, and every ap0
+#     add/del knocks the station off for a few seconds - a restart loop
+#     wedged the BCM43455 firmware hard during validation (chanspec -52,
+#     both interfaces dead until power cycle). Cross-band STA+AP is
+#     tolerated by the firmware (time-slicing) and is the lesser evil.
+#   - For the same reason ap0 is NEVER deleted here: it is created once if
+#     missing and left in place across service restarts (Victron keeps ap0
+#     permanently up on the Cerbo too).
+
+CONF=/data/wifi-ap/wifi-ap.conf
+RUNDIR=/run/wifi-ap
+WPA_CONF=$RUNDIR/wpa-ap.conf
+WPA_CTRL=$RUNDIR/ctrl
+DNSMASQ_PID=$RUNDIR/dnsmasq.pid
+
+log() { echo "wifi-ap: $*"; }
+
+mkdir -p "$RUNDIR"
+
+# --- Read configuration ------------------------------------------------------
+# The file is deliberately NOT sourced: values are extracted literally, so
+# spaces, $, ;, quotes or CRLF line endings (a config re-edited from Windows)
+# can neither break the shell nor execute anything.
+getconf() {
+    sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n 1 | tr -d '\r' \
+        | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//"
+}
+SSID=$(getconf SSID);             SSID="${SSID:-ZeVan}"
+PASSWORD=$(getconf PASSWORD);     PASSWORD="${PASSWORD:-victron1234}"
+CHANNEL=$(getconf CHANNEL);       CHANNEL="${CHANNEL:-1}"
+AP_IP=$(getconf AP_IP);           AP_IP="${AP_IP:-192.168.0.1}"
+DHCP_START=$(getconf DHCP_START)
+DHCP_END=$(getconf DHCP_END)
+DHCP_LEASE=$(getconf DHCP_LEASE); DHCP_LEASE="${DHCP_LEASE:-12h}"
+IFACE=$(getconf IFACE);           IFACE="${IFACE:-wlan0}"
+AP_IFACE=$(getconf AP_IFACE);     AP_IFACE="${AP_IFACE:-ap0}"
+
+if [ ${#SSID} -lt 1 ] || [ ${#SSID} -gt 32 ]; then
+    log "WARNING: SSID must be 1-32 bytes, using 'ZeVan'"
+    SSID=ZeVan
+fi
+
+# CHANNEL must be a decimal number in a sane range. Anything else would make
+# the arithmetic expansion below fatal (the shell dies, supervise crash-loops
+# the service), so fall back to channel 1 instead. expr defuses the octal
+# trap ('08' would be an invalid octal for $((...)) but is decimal 8 here).
+case "$CHANNEL" in
+    ''|*[!0-9]*) log "WARNING: invalid CHANNEL '$CHANNEL', using 1"; CHANNEL=1 ;;
+    *) CHANNEL=$(expr "$CHANNEL" + 0) ;;
+esac
+if [ "$CHANNEL" -ge 36 ] && [ "$CHANNEL" -le 165 ]; then
+    fb_freq=$((5000 + CHANNEL * 5))
+elif [ "$CHANNEL" -ge 1 ] && [ "$CHANNEL" -le 13 ]; then
+    fb_freq=$((2407 + CHANNEL * 5))
+else
+    log "WARNING: CHANNEL $CHANNEL out of range (1-13 or 36-165), using 1"
+    CHANNEL=1
+    fb_freq=2412
+fi
+
+case "$AP_IP" in
+    *[!0-9.]*|.*|*.|*..*)
+        log "WARNING: invalid AP_IP '$AP_IP', using 192.168.0.1"
+        AP_IP=192.168.0.1 ;;
+esac
+
+# --- WPA2 passphrase -------------------------------------------------------
+# Same precedence as Victron's hostapd-run: the D-Bus setting first (what the
+# gui-v2 password field edits), then the package config, then the factory PSK.
+valid_psk() {
+    [ ${#1} -ge 8 ] && [ ${#1} -le 63 ] || return 1
+    # printable ASCII only, and no " or \ (they would corrupt wpa-ap.conf)
+    printf %s "$1" | LC_ALL=C grep -qE '[^ -~]|["\\]' && return 1
+    return 0
+}
+dbus_psk=""
+n=0
+while [ $n -lt 3 ]; do
+    reply=$(dbus-send --system --print-reply \
+        --dest=com.victronenergy.settings /Settings/Services/AccessPointPassword \
+        com.victronenergy.BusItem.GetValue 2>/dev/null)
+    if [ -n "$reply" ]; then
+        # a reply (even an empty string value) is authoritative - no retry
+        dbus_psk=$(echo "$reply" | grep variant \
+            | awk '{ if (gsub(/^\s+variant\s+string\s+"|"$/, "", $0) == 2) print $0 }')
+        break
+    fi
+    n=$((n+1))
+    sleep 2
+done
+psk=""
+if [ -n "$dbus_psk" ]; then
+    if valid_psk "$dbus_psk"; then
+        psk="$dbus_psk"
+    else
+        log "WARNING: /Settings/Services/AccessPointPassword invalid (8-63 printable chars, no \" or \\), trying PASSWORD from $CONF"
+    fi
+fi
+if [ -z "$psk" ]; then
+    if valid_psk "$PASSWORD"; then
+        psk="$PASSWORD"
+    elif factory=$(cat /data/venus/wpa-psk 2>/dev/null) && valid_psk "$factory"; then
+        psk="$factory"
+    fi
+fi
+if [ -z "$psk" ]; then
+    log "ERROR: no valid WPA2 passphrase (8-63 printable chars, no \" or \\) - set PASSWORD in $CONF"
+    sleep 30
+    exit 1
+fi
+
+# --- Wait for the station interface (phy may come up late at boot) ---------
+n=0
+while ! iw dev "$IFACE" info >/dev/null 2>&1; do
+    n=$((n+1))
+    if [ $n -gt 30 ]; then
+        log "ERROR: interface $IFACE not present"
+        sleep 10
+        exit 1
+    fi
+    sleep 2
+done
+
+rfkill unblock wifi 2>/dev/null
+
+# --- Pick the AP frequency --------------------------------------------------
+# Give the station a chance to associate first (up to 60s): starting the AP
+# on the fallback channel while the station later lands on another one leaves
+# a cross-channel STA+AP where the single radio starves the station's data
+# path - it stays associated but DHCP never completes (observed: wlan0 stuck
+# in connman state "configuration", no LAN access). In the van there is no
+# known network, so this only delays the AP by a minute after boot.
+n=0
+sta_freq=""
+while [ $n -lt 12 ]; do
+    sta_freq=$(iw dev "$IFACE" link 2>/dev/null | awk '/freq:/ { print int($2); exit }')
+    [ -n "$sta_freq" ] && break
+    if [ $n -eq 0 ]; then
+        log "station not associated yet, waiting up to 60s before picking a channel"
+    fi
+    n=$((n+1))
+    sleep 5
+done
+case "$sta_freq" in
+    ''|0) sta_freq="" ;;
+    *)  # DFS range (radar detection, no-IR): an AP cannot beacon there
+        if [ "$sta_freq" -ge 5250 ] && [ "$sta_freq" -le 5720 ]; then
+            log "station on DFS channel ($sta_freq MHz), falling back to channel $CHANNEL"
+            sta_freq=""
+        fi ;;
+esac
+freq="${sta_freq:-$fb_freq}"
+
+country=$(iw reg get 2>/dev/null | awk '/^country/ { sub(":","",$2); print $2; exit }')
+
+# --- Clear any previous AP state ---------------------------------------------
+# A residual wpa_supplicant (e.g. after a supervise kill) would hold the ctrl
+# socket and make the new one fail with "ctrl_iface exists". ap0 itself is
+# deliberately NOT deleted (see header).
+kill $(ps | grep "wpa_supplicant -i $AP_IFACE" | grep -v grep | awk '{print $1}') 2>/dev/null
+sleep 1
+
+# --- Guard against a subnet collision with the uplink -------------------------
+# 192.168.0.0/24 is the most common home/campsite router subnet; if the wlan0
+# uplink already sits on the AP subnet, clients would get broken routing.
+prefix=$(echo "$AP_IP" | cut -d. -f1-3)
+if ip -4 addr show 2>/dev/null | grep "inet $prefix\." | grep -qv " $AP_IFACE\$"; then
+    log "WARNING: subnet $prefix.0/24 already in use by an uplink, falling back to 172.24.24.0/24"
+    AP_IP=172.24.24.1
+    DHCP_START=172.24.24.10
+    DHCP_END=172.24.24.200
+    prefix=172.24.24
+fi
+AP_NET="$prefix.0/24"
+DHCP_START="${DHCP_START:-$prefix.100}"
+DHCP_END="${DHCP_END:-$prefix.200}"
+
+# --- NAT helpers -------------------------------------------------------------
+apply_nat() {
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    remove_nat
+    # Masquerade only AP-subnet traffic, whatever the egress is (wwan0 in the
+    # van, whatever the default route says elsewhere).
+    iptables -t nat -A POSTROUTING -s "$AP_NET" ! -d "$AP_NET" -j MASQUERADE
+    iptables -A FORWARD -i "$AP_IFACE" -j ACCEPT
+    iptables -A FORWARD -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    # Clamp TCP MSS to the path MTU. A cellular upstream is rarely 1500 (NCM
+    # links are typically 1450); without this, clients hit PMTU black holes.
+    iptables -t mangle -A FORWARD -s "$AP_NET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+        || log "WARNING: TCPMSS target unavailable, clients may hit PMTU black holes"
+    log "NAT enabled for $AP_NET"
+}
+
+remove_nat() {
+    iptables -t nat -D POSTROUTING -s "$AP_NET" ! -d "$AP_NET" -j MASQUERADE 2>/dev/null
+    iptables -D FORWARD -i "$AP_IFACE" -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    iptables -t mangle -D FORWARD -s "$AP_NET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+    # v1 rules (fixed upstream) - migration cleanup, harmless if absent
+    for up in wwan0 eth0 wlan0; do
+        iptables -t nat -D POSTROUTING -o $up -j MASQUERADE 2>/dev/null
+        iptables -t nat -D POSTROUTING -s "$AP_NET" -o $up -j MASQUERADE 2>/dev/null
+        iptables -D FORWARD -i "$AP_IFACE" -o $up -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -i $up -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+        iptables -t mangle -D FORWARD -o $up -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+    done
+    return 0
+}
+
+# --- Teardown on service stop (svc -d / svc -t by venus-platform) -----------
+wpa_pid=""
+finish() {
+    if [ -n "$wpa_pid" ]; then
+        kill "$wpa_pid" 2>/dev/null
+        wait "$wpa_pid" 2>/dev/null
+    fi
+    kill "$(cat "$DNSMASQ_PID" 2>/dev/null)" 2>/dev/null
+    remove_nat
+    # ap0 is left in place, down: deleting it disturbs the station and
+    # repeated add/del cycles can wedge the BCM43455 firmware (see header)
+    ip addr flush dev "$AP_IFACE" 2>/dev/null
+    ip link set "$AP_IFACE" down 2>/dev/null
+    log "AP stopped, $AP_IFACE kept (down)"
+}
+trap finish EXIT
+# busybox ash does NOT run the EXIT trap on an untrapped TERM (bash does);
+# route TERM/INT through exit so the teardown is guaranteed under both shells.
+trap 'exit 143' TERM INT
+
+# --- Create the virtual AP interface if missing (kept across restarts) ------
+# Do NOT touch $IFACE: the station stays associated (concurrent STA+AP).
+if ! ip link show "$AP_IFACE" >/dev/null 2>&1; then
+    addr=$(cat "/sys/class/net/$IFACE/address")
+    first=${addr%%:*}
+    firstl=$(printf '%02x' $(( 0x$first | 0x02 )))   # locally-administered bit
+    apaddr="$firstl${addr#"$first"}"
+    if ! iw dev "$IFACE" interface add "$AP_IFACE" type __ap addr "$apaddr"; then
+        log "ERROR: cannot create $AP_IFACE"
+        sleep 10
+        exit 1
+    fi
+fi
+# brcmfmac may override the requested MAC on virtual interfaces - read back
+apaddr=$(cat "/sys/class/net/$AP_IFACE/address" 2>/dev/null || echo "$apaddr")
+ip link set "$AP_IFACE" up 2>/dev/null
+ip addr replace "$AP_IP/24" dev "$AP_IFACE"
+
+# --- Start the AP with wpa_supplicant (mode=2 = AP) --------------------------
+# The SSID is written in hex form so any byte (spaces, quotes, UTF-8) is safe.
+ssid_hex=$(printf %s "$SSID" | hexdump -v -e '1/1 "%02x"' 2>/dev/null)
+[ -n "$ssid_hex" ] || ssid_hex=$(printf %s "$SSID" | od -A n -t x1 | tr -d ' \n')
+
+gen_wpa() {
+    umask 077
+    {
+        echo "ctrl_interface=$WPA_CTRL"
+        echo "ap_scan=2"
+        if [ -n "$country" ] && [ "$country" != "00" ]; then
+            echo "country=$country"
+        fi
+        echo "network={"
+        echo "    ssid=$ssid_hex"
+        echo "    mode=2"
+        echo "    frequency=$1"
+        echo "    key_mgmt=WPA-PSK"
+        echo "    proto=RSN"
+        echo "    pairwise=CCMP"
+        echo "    group=CCMP"
+        echo "    psk=\"$psk\""
+        echo "}"
+    } > "$WPA_CONF"
+}
+
+start_ap() {    # $1 = frequency in MHz; returns 0 once the AP beacons
+    gen_wpa "$1"
+    wpa_supplicant -i "$AP_IFACE" -c "$WPA_CONF" &
+    wpa_pid=$!
+    n=0
+    while [ $n -lt 15 ]; do
+        sleep 1
+        state=$(wpa_cli -p "$WPA_CTRL" -i "$AP_IFACE" status 2>/dev/null | awk -F= '/^wpa_state/ {print $2}')
+        [ "$state" = "COMPLETED" ] && return 0
+        kill -0 "$wpa_pid" 2>/dev/null || break
+        n=$((n+1))
+    done
+    kill "$wpa_pid" 2>/dev/null
+    wait "$wpa_pid" 2>/dev/null
+    wpa_pid=""
+    return 1
+}
+
+log "SSID=$SSID freq=${freq}MHz ip=$AP_IP (station: ${sta_freq:-not associated})"
+if ! start_ap "$freq"; then
+    if [ "$freq" != "$fb_freq" ]; then
+        log "AP failed on $freq MHz, retrying on fallback $fb_freq MHz"
+        freq=$fb_freq
+        if ! start_ap "$freq"; then
+            log "ERROR: AP would not start"
+            sleep 10
+            exit 1
+        fi
+    else
+        log "ERROR: AP would not start"
+        sleep 10
+        exit 1
+    fi
+fi
+log "AP up on $freq MHz (bssid $apaddr)"
+
+# --- DHCP for clients ---------------------------------------------------------
+kill "$(cat /var/run/dnsmasq-ap0.pid 2>/dev/null)" 2>/dev/null   # legacy v1 pidfile
+kill "$(cat "$DNSMASQ_PID" 2>/dev/null)" 2>/dev/null
+if dnsmasq \
+    --interface="$AP_IFACE" \
+    --bind-interfaces \
+    --dhcp-range="$DHCP_START,$DHCP_END,$DHCP_LEASE" \
+    --dhcp-option=3,"$AP_IP" \
+    --dhcp-option=6,8.8.8.8,1.1.1.1 \
+    --no-resolv \
+    --port=0 \
+    --dhcp-leasefile="$RUNDIR/dnsmasq.leases" \
+    --pid-file="$DNSMASQ_PID"; then
+    log "dnsmasq DHCP $DHCP_START-$DHCP_END started"
+else
+    log "WARNING: dnsmasq failed to start (clients will get no DHCP lease)"
+fi
+
+apply_nat
+
+# --- Supervised: hold until wpa_supplicant exits or the service is stopped ---
+# No channel chasing here: a mismatch with a roaming station is tolerated
+# (see header). The channel is re-evaluated at each service start - i.e. on
+# UI toggle, password change or reboot.
+wait "$wpa_pid"
+rc=$?
+wpa_pid=""
+log "wpa_supplicant exited (code $rc)"
+sleep 3
+exit 1

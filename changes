@@ -1,3 +1,48 @@
+v2.1
+- New: wifi-watchdog service (SetupHelper-managed, always on). The BCM43455
+  firmware can wedge hard in concurrent STA+AP use (raspberrypi/linux#7092,
+  chanspec -52 storms, WiFi dead until power cycle - observed twice during
+  validation, once triggered by a mere password change, i.e. the native
+  svc -t restart, with a client connecting). The watchdog detects the wedge
+  (fresh -52 errors with the station down, or a zombie AP, 3 consecutive
+  30s checks), then recovers: stop AP -> reload brcmfmac -> reboot as last
+  resort (rate-limited to one per 15 min). Forensics persist in
+  /data/log/wifi-ap/ (/var/log is tmpfs and dies with the power cycle).
+
+v2.0
+- Rewrite: the AP no longer needs hostapd (absent from the arm64/raspberrypi5
+  feeds). The engine files/wifi-ap-run runs the image's wpa_supplicant in AP
+  mode (mode=2, CONFIG_AP) on a virtual ap0 created NEXT TO the wlan0 station:
+  concurrent STA+AP, like a Cerbo GX. Validated on Pi 5 / BCM43455 / Venus 3.75
+  with a real client (association, DHCP lease, NAT traffic), the wlan0 client
+  connection staying up throughout.
+- New: native UI integration. setup installs the hostapd service TEMPLATE
+  (/opt/victronenergy/service-templates/hostapd/ + the empty marker
+  conf/hostapd.conf that venus-platform's templateExists() checks). Once
+  venus-platform restarts it publishes /Services/AccessPoint/Enabled: the
+  stock "Create access point" toggle appears in Settings > Wi-Fi in BOTH GUIs
+  and installs/removes /service/hostapd through svectl - exactly the Cerbo
+  flow. No QML is patched.
+- New: password via /Settings/Services/AccessPointPassword (declared with
+  AddSettings; venus-platform natively restarts the service when it changes),
+  with PASSWORD from wifi-ap.conf as fallback (8-63 chars enforced).
+- New: channel follows the wlan0 station when it is associated (single-radio
+  constraint); falls back to CHANNEL from wifi-ap.conf when the station is
+  not connected (van use case) or sits on a DFS channel. Second start attempt
+  on the fallback channel if the first frequency is refused.
+- Change: NAT is now egress-agnostic (MASQUERADE scoped to the AP subnet,
+  whatever the default route is: wwan0 in the van, wlan0/eth0 elsewhere).
+  UPSTREAM in wifi-ap.conf is no longer used; old fixed-upstream rules are
+  cleaned up on start and uninstall.
+- Removed: the no-op services/wifi-ap placeholder (and its INSTALL_SERVICES).
+  setup removes it from existing installs, along with legacy hostapd-native.
+- Removed: the dummy /data/venus/serial-number hack. The engine does not
+  derive the SSID from the serial, and venus-platform's gate is only the
+  template marker.
+- Uninstall: disables the AP, mirrors svectl -r if venus-platform is down,
+  restores the stock template where one existed (Cerbo-like images) or
+  removes ours, and tears down ap0/NAT/DHCP leftovers.
+
 v1.2
 - Fix: services/wifi-ap/run carried a UTF-8 BOM, so the kernel did not see a
   valid shebang and runsv could not exec it. Combined with "sleep infinity"

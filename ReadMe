@@ -1,20 +1,24 @@
 VenusOS-WiFiAP
 ==============
 
-WiFi Access Point with 4G internet sharing for Venus OS on Raspberry Pi 3.
+Cerbo GX-style WiFi Access Point for Venus OS on Raspberry Pi, with 4G/NAT
+internet sharing. The WiFi stays a client (wlan0) AND becomes an access
+point (ap0) at the same time - concurrent STA+AP, like on a Cerbo GX.
 
-Creates a virtual ap0 interface on the BCM43438 chip and runs a full AP stack:
-hostapd (WPA2), dnsmasq (DHCP), iptables NAT toward wwan0 (4G modem).
+No hostapd needed: the AP runs on the image's wpa_supplicant (built with
+CONFIG_AP). The package installs the native "hostapd" service template, so
+venus-platform publishes the real Victron toggle: the AP is switched on/off
+from the stock UI (both GUI v1 and gui-v2), and the AP password can be
+managed through /Settings/Services/AccessPointPassword like on a Cerbo.
 
-Compatible with VenusOS-E3372h (Huawei 4G modem package).
+Validated on Raspberry Pi 5 (BCM43455) / Venus OS 3.75. Works on the
+Pi 3 (BCM43438) as well.
 
 ## Requirements
 
 - Venus OS v3.50 or later
-- Raspberry Pi 3 (BCM43438 WiFi chip)
+- Raspberry Pi with the built-in Broadcom WiFi (Pi 3/4/5)
 - SetupHelper (kwindrem) installed
-- hostapd installed: `opkg install hostapd`
-- E3372h 4G modem connected on wwan0 (for internet sharing)
 
 ## Installation
 
@@ -24,28 +28,57 @@ Via SetupHelper PackageManager (recommended):
 Manual:
   cd /data/VenusOS-WiFiAP && bash setup install auto
 
+After install the AP is ENABLED by default (Victron behaviour: the setting
+/Settings/Services/AccessPoint is created with default 1).
+
 ## Configuration
 
-Edit /data/wifi-ap/wifi-ap.conf :
+Toggle in the UI: Settings > Wi-Fi > "Create access point".
+
+Edit /data/wifi-ap/wifi-ap.conf for the rest:
 
   SSID=ZeVan              # WiFi network name
-  PASSWORD=victron1234    # WPA2 password (8-63 chars)
-  CHANNEL=1               # WiFi channel (1-11)
-  AP_IP=192.168.0.1       # RPi3 gateway IP
-  UPSTREAM=wwan0          # Interface for internet sharing
+  PASSWORD=victron1234    # fallback WPA2 password (8-63 chars) - only used
+                          # when /Settings/Services/AccessPointPassword is empty
+  CHANNEL=1               # fallback channel (1-13), used when wlan0 is not
+                          # connected; otherwise the AP follows wlan0's channel
+  AP_IP=192.168.0.1       # Pi gateway IP on the AP network
 
-After editing: svc -t /service/wifi-ap
+After editing: svc -t /service/hostapd  (or flip the UI toggle off/on)
 
 ## Connecting
 
 - Connect your device to WiFi "ZeVan" (or your custom SSID)
 - Your device gets IP 192.168.0.x via DHCP
-- Internet via 4G (wwan0) — shared with NAT
-- SSH to RPi3: ssh root@192.168.0.1
+- Internet is shared with NAT toward whatever uplink is active (4G wwan0
+  in the van, or the wlan0/eth0 connection elsewhere), with TCP MSS
+  clamping for cellular MTUs
+- SSH to the Pi: ssh root@192.168.0.1
+
+## How it works
+
+  UI toggle -> com.victronenergy.platform /Services/AccessPoint/Enabled
+    -> /Settings/Services/AccessPoint (localsettings)
+    -> venus-platform -> svectl -s hostapd -> /service/hostapd
+    -> template run -> /data/VenusOS-WiFiAP/files/wifi-ap-run
+    -> ap0 + wpa_supplicant (mode AP) + dnsmasq (DHCP) + iptables (NAT)
+
+venus-platform only publishes the toggle when
+/opt/victronenergy/service-templates/conf/hostapd.conf exists - that marker
+and the template are what this package installs. A password change on
+/Settings/Services/AccessPointPassword restarts the service automatically
+(native venus-platform behaviour).
 
 ## Notes
 
-- connman tethering is disabled on install (conflicts with ap0)
-- The native /service/hostapd is disabled (hostapd-run requires serial-number absent on DIY RPi3)
+- Single radio: when wlan0 is connected, the AP runs on the same channel
+  (or cross-band, the firmware time-slices).
+- Known firmware issue raspberrypi/linux#7092 (BCM43455, kernel 6.12): the
+  firmware can wedge during AP restarts with clients around - a password
+  change restarts the AP (native venus-platform behaviour) and can trigger
+  it. The bundled wifi-watchdog service detects the wedge and self-heals
+  (driver reload, then a recovery reboot at worst); forensic snapshots go
+  to /data/log/wifi-ap/wedge.log.
 - wifi-ap.conf is preserved on reinstall / Venus OS update
-- Logs: tail -f /var/log/wifi-ap/current
+- Logs: tail -F /var/log/hostapd/current
+- connman ignores ap0 (NetworkInterfaceBlacklist includes "ap")

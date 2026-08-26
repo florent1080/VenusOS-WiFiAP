@@ -1,0 +1,149 @@
+#!/bin/sh
+# VenusOS-WiFiAP - wifi-watchdog
+#
+# The BCM43455 firmware on kernel 6.12 can wedge hard in concurrent STA+AP
+# use (raspberrypi/linux#7092): chanspec -52 error storms, both wlan0 and
+# ap0 dead until a power cycle. On a headless box in a van that means total
+# loss of access (WiFi AND Tailscale, since DNS goes down with the flaps).
+#
+# This watchdog turns that into a ~2 minute self-heal:
+#   detect  : new -52 firmware errors while the station is disconnected, or
+#             a zombie AP (service up >60s but wpa_state != COMPLETED),
+#             confirmed over 3 consecutive 30s checks
+#   recover : stop the AP service -> reload the brcmfmac driver -> if wlan0
+#             is still gone, reboot (rate-limited to one per 15 minutes)
+# Forensics land in /data/log/wifi-ap/ (persistent - /var/log is tmpfs).
+echo "*** starting wifi-watchdog ***"
+exec 2>&1
+
+INTERVAL=30
+DBG=/data/log/wifi-ap
+mkdir -p "$DBG"
+
+log() { echo "wifi-watchdog: $*"; }
+
+# timestamp (integer seconds) of the last firmware error line in dmesg
+err_ts() {
+    dmesg | awk -F'[][]' \
+        '/chanspec failed \(-52\)|vndr ie set error : -52|brcmf_fw_crashed|firmware trap/ { ts=$2 }
+         END { printf "%d\n", ts+0 }'
+}
+
+ap_zombie() {
+    s=$(svstat /run/service/hostapd 2>/dev/null) || return 1
+    echo "$s" | grep -q ": up " || return 1
+    secs=$(echo "$s" | sed -n 's/.* up (pid [0-9]*) \([0-9]*\) seconds.*/\1/p')
+    [ -n "$secs" ] && [ "$secs" -gt 60 ] || return 1
+    state=$(wpa_cli -p /run/wifi-ap/ctrl -i ap0 status 2>/dev/null \
+            | awk -F= '/^wpa_state/ {print $2}')
+    [ "$state" = "COMPLETED" ] && return 1
+    return 0
+}
+
+# Cross-channel starvation: the station is associated but keeps no IPv4
+# while the AP is up - the single radio starves the station's data path
+# when AP and station sit on different channels (wlan0 stuck in connman
+# state "configuration", LAN dead while everything "looks" up).
+# Cure: restart the AP service - its engine re-reads the station channel
+# and realigns (ap0 is reused, no interface churn).
+sta_starved() {
+    svstat /run/service/hostapd 2>/dev/null | grep -q ": up " || return 1
+    iw dev wlan0 link 2>/dev/null | grep -q Connected || return 1
+    ip -4 addr show wlan0 2>/dev/null | grep -q "inet " && return 1
+    return 0
+}
+
+sleep 60    # let the system finish booting before judging anything
+
+last52=$(err_ts)
+bad=0
+starved=0
+
+while true; do
+    sleep $INTERVAL
+
+    # --- cross-channel starvation: gentle realign, before wedge logic ----
+    if sta_starved; then
+        starved=$((starved + 1))
+        log "station associated without IPv4 while AP is up ($starved/3)"
+        if [ $starved -ge 3 ]; then
+            starved=0
+            marker=$DBG/last-realign
+            now=$(date +%s)
+            lastra=$(cat "$marker" 2>/dev/null || echo 0)
+            if [ $((now - lastra)) -ge 600 ]; then
+                echo "$now" > "$marker"
+                log "restarting the AP service to realign its channel"
+                svc -t /service/hostapd 2>/dev/null
+            else
+                log "already realigned <10 min ago - leaving it alone"
+            fi
+        fi
+    else
+        starved=0
+    fi
+
+    wedged=0
+    now52=$(err_ts)
+    if [ "$now52" -gt "$last52" ]; then
+        # fresh firmware errors during the last interval; only worrying if
+        # the station is also out (a lone roam produces a few benign ones)
+        if ! iw dev wlan0 link 2>/dev/null | grep -q Connected; then
+            wedged=1
+        fi
+    fi
+    last52=$now52
+    if [ $wedged -eq 0 ] && ap_zombie; then
+        wedged=1
+    fi
+
+    if [ $wedged -eq 1 ]; then
+        bad=$((bad + 1))
+        log "firmware wedge suspected ($bad/3)"
+        [ $bad -lt 3 ] && continue
+    else
+        bad=0
+        continue
+    fi
+    bad=0
+
+    # --- confirmed: recover ---------------------------------------------
+    { echo "=== wedge $(date '+%Y-%m-%d %H:%M:%S') ==="
+      dmesg | tail -n 60
+      iw dev 2>&1
+      svstat /run/service/hostapd 2>&1
+    } >> "$DBG/wedge.log"
+    tail -c 262144 "$DBG/wedge.log" > "$DBG/wedge.log.tmp" \
+        && mv "$DBG/wedge.log.tmp" "$DBG/wedge.log"
+
+    log "wedge confirmed - stopping AP and reloading brcmfmac"
+    svc -d /service/hostapd 2>/dev/null
+    sleep 2
+    timeout 20 rmmod brcmfmac_wcc 2>/dev/null
+    timeout 20 rmmod brcmfmac 2>/dev/null
+    sleep 3
+    modprobe brcmfmac 2>/dev/null
+    sleep 25
+
+    if iw dev wlan0 info >/dev/null 2>&1; then
+        log "driver reloaded, wlan0 is back"
+        last52=$(err_ts)
+        if [ "$(dbus -y com.victronenergy.settings /Settings/Services/AccessPoint GetValue 2>/dev/null)" = "1" ]; then
+            svc -u /service/hostapd 2>/dev/null
+            log "AP service resumed"
+        fi
+        continue
+    fi
+
+    marker=$DBG/last-watchdog-reboot
+    now=$(date +%s)
+    lastrb=$(cat "$marker" 2>/dev/null || echo 0)
+    if [ $((now - lastrb)) -lt 900 ]; then
+        log "driver still dead but last recovery reboot was <15 min ago - waiting"
+        continue
+    fi
+    echo "$now" > "$marker"
+    log "driver still dead after reload - RECOVERY REBOOT"
+    sync
+    reboot
+done
