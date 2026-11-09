@@ -1,3 +1,28 @@
+v2.2
+- Fix: the WiFi client (wlan0) joined a network but never got an address
+  when that network was on another channel than the AP (2026-11-09: AP on
+  channel 1, phone hotspot on channel 6; connman gave up after a minute).
+  The chip holds one channel for the client and the AP together (iw phy:
+  "#channels <= 1"); the ReadMe was wrong to say two channels are tolerated.
+  The engine now watches the client and moves the AP to its channel
+  (FOLLOW_STATION=1, the default; 0 = as before). Only wpa_supplicant on ap0
+  is restarted - ap0, its address, DHCP and NAT stay. The client must be
+  seen twice on the new channel (about ten seconds), two moves are at least
+  a minute apart, a channel the AP is refused on is not tried again, and
+  the AP does not move back when the client disconnects.
+- Fix: the watchdog never reloaded the WiFi driver. It ran "timeout 20
+  rmmod ...", and Venus OS's BusyBox has no timeout applet: the command
+  failed silently and the recovery was reported as done. A small helper in
+  the script replaces it.
+- Fix: an uninstall followed by an install left the AP switched off. The
+  uninstall has to switch the setting off; it now records how it was, and
+  the next install puts it back.
+- New: tests/follow_bench.sh, to run on the GX: it drives the engine on the
+  real radio with a pretended client channel.
+- Checked on Venus OS v3.85 (Raspberry Pi 5): still no hostapd and no
+  native AP, venus-platform still publishes the toggle from the template
+  marker; install by PackageManager, AP start and a reboot on 4G all pass.
+
 v2.1
 - New: wifi-watchdog service (SetupHelper-managed, always on). The BCM43455
   firmware can wedge hard in concurrent STA+AP use (raspberrypi/linux#7092,

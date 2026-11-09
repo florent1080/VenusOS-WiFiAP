@@ -11,8 +11,9 @@ venus-platform publishes the real Victron toggle: the AP is switched on/off
 from the stock UI (both GUI v1 and gui-v2), and the AP password can be
 managed through /Settings/Services/AccessPointPassword like on a Cerbo.
 
-Validated on Raspberry Pi 5 (BCM43455) / Venus OS 3.75. Works on the
-Pi 3 (BCM43438) as well.
+Validated on Raspberry Pi 5 (BCM43455) / Venus OS 3.75 and 3.85. Works on
+the Pi 3 (BCM43438) as well. Venus OS 3.85 still ships neither hostapd nor
+an access point of its own on the Raspberry Pi images.
 
 ## Requirements
 
@@ -29,7 +30,8 @@ Manual:
   cd /data/VenusOS-WiFiAP && bash setup install auto
 
 After install the AP is ENABLED by default (Victron behaviour: the setting
-/Settings/Services/AccessPoint is created with default 1).
+/Settings/Services/AccessPoint is created with default 1). An uninstall
+switches it off; the next install puts it back the way it was.
 
 ## Configuration
 
@@ -42,6 +44,8 @@ Edit /data/wifi-ap/wifi-ap.conf for the rest:
                           # when /Settings/Services/AccessPointPassword is empty
   CHANNEL=1               # fallback channel (1-13), used when wlan0 is not
                           # connected; otherwise the AP follows wlan0's channel
+  FOLLOW_STATION=1        # move the AP when wlan0 joins a network on another
+                          # channel (see Notes); 0 = channel chosen at start only
   AP_IP=192.168.0.1       # Pi gateway IP on the AP network
 
 After editing: svc -t /service/hostapd  (or flip the UI toggle off/on)
@@ -71,14 +75,28 @@ and the template are what this package installs. A password change on
 
 ## Notes
 
-- Single radio: when wlan0 is connected, the AP runs on the same channel
-  (or cross-band, the firmware time-slices).
+- Single radio, single channel: the chip holds ONE channel for the WiFi
+  client (wlan0) and the AP together (iw phy: "#channels <= 1"). The client
+  has priority. At start the AP takes the client's channel, and when the
+  client later joins a network on another channel the AP moves there within
+  about ten seconds; devices on the AP lose it for a few seconds and
+  reconnect. Up to v2.1 the AP stayed where it had started, and the client
+  then joined the network without ever getting an address (2026-11-09: AP on
+  channel 1, phone hotspot on channel 6).
+  Limits: the AP cannot follow the client onto a DFS channel (5250-5720 MHz,
+  no beacons allowed there), a channel the AP is refused on is not tried
+  again until the AP restarts, and two moves are at least a minute apart.
+  In both limit cases the client is the one left without an address.
 - Known firmware issue raspberrypi/linux#7092 (BCM43455, kernel 6.12): the
   firmware can wedge during AP restarts with clients around - a password
   change restarts the AP (native venus-platform behaviour) and can trigger
   it. The bundled wifi-watchdog service detects the wedge and self-heals
   (driver reload, then a recovery reboot at worst); forensic snapshots go
-  to /data/log/wifi-ap/wedge.log.
+  to /data/log/wifi-ap/wedge.log. (Up to v2.1 the driver reload never ran:
+  it relied on a "timeout" command Venus OS does not have.)
+- tests/follow_bench.sh checks the channel follower on the GX itself, on the
+  real radio, with a pretended client channel. It stops the AP for about
+  five minutes and needs the WiFi client to be disconnected.
 - wifi-ap.conf is preserved on reinstall / Venus OS update
 - Logs: tail -F /var/log/hostapd/current
 - connman ignores ap0 (NetworkInterfaceBlacklist includes "ap")

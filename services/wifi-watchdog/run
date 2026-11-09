@@ -12,6 +12,9 @@
 #             confirmed over 3 consecutive 30s checks
 #   recover : stop the AP service -> reload the brcmfmac driver -> if wlan0
 #             is still gone, reboot (rate-limited to one per 15 minutes)
+# It also restarts the AP when the station is associated but has no address
+# (station and AP on two channels) - a second line behind the engine, which
+# since v2.2 moves the AP to the station's channel by itself.
 # Forensics land in /data/log/wifi-ap/ (persistent - /var/log is tmpfs).
 echo "*** starting wifi-watchdog ***"
 exec 2>&1
@@ -21,6 +24,28 @@ DBG=/data/log/wifi-ap
 mkdir -p "$DBG"
 
 log() { echo "wifi-watchdog: $*"; }
+
+# Run a command and kill it when it has not returned after $1 seconds: rmmod
+# can hang on a wedged firmware. Venus OS's BusyBox has no "timeout" applet -
+# up to v2.1 "timeout 20 rmmod ..." was "command not found", silently, and
+# the driver was never reloaded.
+run_max() {
+    max=$1
+    shift
+    "$@" &
+    cpid=$!
+    waited=0
+    while kill -0 $cpid 2>/dev/null; do
+        if [ $waited -ge $max ]; then
+            kill -9 $cpid 2>/dev/null
+            log "'$*' still running after ${max}s, killed"
+            return 124
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    wait $cpid
+}
 
 # timestamp (integer seconds) of the last firmware error line in dmesg
 err_ts() {
@@ -119,8 +144,8 @@ while true; do
     log "wedge confirmed - stopping AP and reloading brcmfmac"
     svc -d /service/hostapd 2>/dev/null
     sleep 2
-    timeout 20 rmmod brcmfmac_wcc 2>/dev/null
-    timeout 20 rmmod brcmfmac 2>/dev/null
+    run_max 20 rmmod brcmfmac_wcc 2>/dev/null
+    run_max 20 rmmod brcmfmac 2>/dev/null
     sleep 3
     modprobe brcmfmac 2>/dev/null
     sleep 25

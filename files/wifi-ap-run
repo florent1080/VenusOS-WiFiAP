@@ -17,18 +17,28 @@
 # venus-platform restart the service (svc -t), which regenerates the
 # configuration here.
 #
-# Channel policy (single radio, iw: "#{ managed } <= 1, #{ AP } <= 1"):
-#   - station associated on a non-DFS channel AT STARTUP -> AP takes that
-#     channel; otherwise CHANNEL from wifi-ap.conf (2.4 GHz fallback).
-#   - The channel is chosen at startup ONLY, like Victron's own AP. Chasing
-#     the station afterwards means deleting/recreating ap0, and every ap0
-#     add/del knocks the station off for a few seconds - a restart loop
-#     wedged the BCM43455 firmware hard during validation (chanspec -52,
-#     both interfaces dead until power cycle). Cross-band STA+AP is
-#     tolerated by the firmware (time-slicing) and is the lesser evil.
-#   - For the same reason ap0 is NEVER deleted here: it is created once if
-#     missing and left in place across service restarts (Victron keeps ap0
-#     permanently up on the Cerbo too).
+# Channel policy. One radio, and it holds ONE channel for the station and the
+# AP together - iw phy on the Pi 5 (BCM43455):
+#   "#{ managed } <= 1, #{ AP } <= 1, ..., total <= 4, #channels <= 1"
+#   - At startup the AP takes the station's channel when the station is
+#     associated on a non-DFS one; otherwise CHANNEL from wifi-ap.conf.
+#   - While running, the station has priority (FOLLOW_STATION=1): when it
+#     associates on another non-DFS channel, the AP is restarted on that
+#     channel. Left on two channels, the station stays associated but never
+#     gets a DHCP answer. Seen on 2026-11-09: AP on channel 1, a phone
+#     hotspot on channel 6, connman gave up after a minute and the GX could
+#     not be reached over WiFi. Devices on the AP lose it for a few seconds
+#     and rejoin on the new channel.
+#   - The AP does not move back when the station disconnects, and it cannot
+#     follow the station onto a DFS channel (no beacons allowed there).
+#   - A move restarts wpa_supplicant on ap0 and nothing else. ap0 itself is
+#     NEVER deleted: it is created once if missing and left in place (Victron
+#     keeps ap0 permanently up on the Cerbo too). Every ap0 add/del knocks
+#     the station off for a few seconds, and a restart loop wedged the
+#     BCM43455 firmware hard during validation (chanspec -52, both
+#     interfaces dead until power cycle). Moves are rate-limited for the
+#     same reason: the station must be seen twice on the new channel, and
+#     two moves are at least a minute apart.
 
 CONF=/data/wifi-ap/wifi-ap.conf
 RUNDIR=/run/wifi-ap
@@ -57,6 +67,7 @@ DHCP_END=$(getconf DHCP_END)
 DHCP_LEASE=$(getconf DHCP_LEASE); DHCP_LEASE="${DHCP_LEASE:-12h}"
 IFACE=$(getconf IFACE);           IFACE="${IFACE:-wlan0}"
 AP_IFACE=$(getconf AP_IFACE);     AP_IFACE="${AP_IFACE:-ap0}"
+FOLLOW=$(getconf FOLLOW_STATION); FOLLOW="${FOLLOW:-1}"
 
 if [ ${#SSID} -lt 1 ] || [ ${#SSID} -gt 32 ]; then
     log "WARNING: SSID must be 1-32 bytes, using 'ZeVan'"
@@ -153,10 +164,17 @@ rfkill unblock wifi 2>/dev/null
 # path - it stays associated but DHCP never completes (observed: wlan0 stuck
 # in connman state "configuration", no LAN access). In the van there is no
 # known network, so this only delays the AP by a minute after boot.
+# frequency (MHz) the station is associated on, empty when it is not
+sta_freq_now() {
+    iw dev "$IFACE" link 2>/dev/null | awk '/freq:/ { print int($2); exit }'
+}
+# DFS range (radar detection, no-IR): an AP cannot beacon there
+is_dfs() { [ "$1" -ge 5250 ] && [ "$1" -le 5720 ]; }
+
 n=0
 sta_freq=""
 while [ $n -lt 12 ]; do
-    sta_freq=$(iw dev "$IFACE" link 2>/dev/null | awk '/freq:/ { print int($2); exit }')
+    sta_freq=$(sta_freq_now)
     [ -n "$sta_freq" ] && break
     if [ $n -eq 0 ]; then
         log "station not associated yet, waiting up to 60s before picking a channel"
@@ -166,8 +184,7 @@ while [ $n -lt 12 ]; do
 done
 case "$sta_freq" in
     ''|0) sta_freq="" ;;
-    *)  # DFS range (radar detection, no-IR): an AP cannot beacon there
-        if [ "$sta_freq" -ge 5250 ] && [ "$sta_freq" -le 5720 ]; then
+    *)  if is_dfs "$sta_freq"; then
             log "station on DFS channel ($sta_freq MHz), falling back to channel $CHANNEL"
             sta_freq=""
         fi ;;
@@ -331,29 +348,103 @@ fi
 log "AP up on $freq MHz (bssid $apaddr)"
 
 # --- DHCP for clients ---------------------------------------------------------
-kill "$(cat /var/run/dnsmasq-ap0.pid 2>/dev/null)" 2>/dev/null   # legacy v1 pidfile
-kill "$(cat "$DNSMASQ_PID" 2>/dev/null)" 2>/dev/null
-if dnsmasq \
-    --interface="$AP_IFACE" \
-    --bind-interfaces \
-    --dhcp-range="$DHCP_START,$DHCP_END,$DHCP_LEASE" \
-    --dhcp-option=3,"$AP_IP" \
-    --dhcp-option=6,8.8.8.8,1.1.1.1 \
-    --no-resolv \
-    --port=0 \
-    --dhcp-leasefile="$RUNDIR/dnsmasq.leases" \
-    --pid-file="$DNSMASQ_PID"; then
-    log "dnsmasq DHCP $DHCP_START-$DHCP_END started"
-else
-    log "WARNING: dnsmasq failed to start (clients will get no DHCP lease)"
-fi
+start_dhcp() {
+    kill "$(cat /var/run/dnsmasq-ap0.pid 2>/dev/null)" 2>/dev/null   # legacy v1 pidfile
+    kill "$(cat "$DNSMASQ_PID" 2>/dev/null)" 2>/dev/null
+    if dnsmasq \
+        --interface="$AP_IFACE" \
+        --bind-interfaces \
+        --dhcp-range="$DHCP_START,$DHCP_END,$DHCP_LEASE" \
+        --dhcp-option=3,"$AP_IP" \
+        --dhcp-option=6,8.8.8.8,1.1.1.1 \
+        --no-resolv \
+        --port=0 \
+        --dhcp-leasefile="$RUNDIR/dnsmasq.leases" \
+        --pid-file="$DNSMASQ_PID"; then
+        log "dnsmasq DHCP $DHCP_START-$DHCP_END started"
+    else
+        log "WARNING: dnsmasq failed to start (clients will get no DHCP lease)"
+    fi
+}
+start_dhcp
 
 apply_nat
 
+# --- Move the AP to the station's channel ------------------------------------
+# Only wpa_supplicant is restarted: ap0, its address, the DHCP server and the
+# NAT rules stay as they are. Returns 1 when no AP could be brought back.
+POLL=5          # seconds between two looks at the station
+MOVE_GAP=60     # seconds at least between two moves
+uptime_s() { cut -d. -f1 /proc/uptime; }    # not the clock: it can be set
+move_ap() {     # $1 = the station's frequency in MHz
+    old=$freq
+    log "station on $1 MHz, AP on $old MHz: moving the AP (one radio, one channel)"
+    kill "$wpa_pid" 2>/dev/null
+    wait "$wpa_pid" 2>/dev/null
+    wpa_pid=""
+    if start_ap "$1"; then
+        freq=$1
+        log "AP up on $freq MHz (moved from $old MHz)"
+    else
+        refused=$1
+        log "AP refused on $1 MHz, back to $old MHz"
+        if ! start_ap "$old"; then
+            log "ERROR: AP would not restart"
+            return 1
+        fi
+    fi
+    last_move=$(uptime_s)
+    # the address and the DHCP server normally survive; make sure of both
+    ip link set "$AP_IFACE" up 2>/dev/null
+    ip addr replace "$AP_IP/24" dev "$AP_IFACE"
+    kill -0 "$(cat "$DNSMASQ_PID" 2>/dev/null)" 2>/dev/null || start_dhcp
+    return 0
+}
+
 # --- Supervised: hold until wpa_supplicant exits or the service is stopped ---
-# No channel chasing here: a mismatch with a roaming station is tolerated
-# (see header). The channel is re-evaluated at each service start - i.e. on
-# UI toggle, password change or reboot.
+# Meanwhile the station is watched, and the AP follows it (see the header).
+# FOLLOW_STATION=0 keeps the channel chosen at startup, as up to v2.1.
+cand=""         # frequency the station was last seen on, when not the AP's
+cand_n=0        # ... and how many looks in a row
+refused=""      # frequency the AP would not start on: not tried again
+dfs_told=""
+last_move=""
+while kill -0 "$wpa_pid" 2>/dev/null; do
+    # sleep in the background: a TERM from supervise then ends the wait at
+    # once instead of after the sleep
+    sleep $POLL &
+    wait $!
+    [ "$FOLLOW" = "0" ] && continue
+    f=$(sta_freq_now)
+    case "$f" in ''|0) cand=""; cand_n=0; continue ;; esac
+    if [ "$f" = "$freq" ]; then
+        cand=""; cand_n=0
+        continue
+    fi
+    if is_dfs "$f"; then
+        if [ "$dfs_told" != "$f" ]; then
+            log "station on DFS channel ($f MHz): the AP cannot follow it there, the station may get no address"
+            dfs_told=$f
+        fi
+        continue
+    fi
+    [ "$f" = "$refused" ] && continue
+    if [ "$f" = "$cand" ]; then
+        cand_n=$((cand_n + 1))
+    else
+        cand=$f
+        cand_n=1
+    fi
+    [ $cand_n -ge 2 ] || continue
+    if [ -n "$last_move" ] && [ $(( $(uptime_s) - last_move )) -lt $MOVE_GAP ]; then
+        continue
+    fi
+    cand=""; cand_n=0
+    if ! move_ap "$f"; then
+        sleep 10
+        exit 1
+    fi
+done
 wait "$wpa_pid"
 rc=$?
 wpa_pid=""

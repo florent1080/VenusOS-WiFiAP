@@ -33,6 +33,8 @@ TEMPLATE_CONF="/opt/victronenergy/service-templates/conf/hostapd.conf"
 TEMPLATE_RUN_SRC="$packageDir/files/hostapd-template/run"
 TEMPLATE_LOG_SRC="$packageDir/files/hostapd-template/log/run"
 TEMPLATE_BACKUP="$INSTALL_DIR/hostapd-template.orig"
+# whether the AP was on when the package was uninstalled (see UNINSTALL)
+AP_STATE="$INSTALL_DIR/enabled-before-uninstall"
 
 #### following line incorporates helper resources into this script
 source "/data/SetupHelper/HelperResources/IncludeHelpers"
@@ -147,6 +149,19 @@ if [ $scriptAction == 'INSTALL' ] ; then
         logMessage "restarted the running AP to apply the updated engine"
     fi
 
+    # --- Put the AP back the way it was before an uninstall. The uninstall
+    # has to switch the setting off; without this, an uninstall followed by
+    # an install left the AP off with nothing saying so.
+    if [ -f "$AP_STATE" ]; then
+        was="$(cat "$AP_STATE" 2>/dev/null)"
+        rm -f "$AP_STATE"
+        if [ "$was" == "1" ]; then
+            dbus -y com.victronenergy.settings /Settings/Services/AccessPoint SetValue 1 >/dev/null 2>&1 \
+                && logMessage "access point switched back on (it was on before the uninstall)" \
+                || logMessage "NOTE: could not switch the access point back on - use the toggle in Settings > Wi-Fi"
+        fi
+    fi
+
     logMessage "VenusOS-WiFiAP install complete"
     logMessage "AP SSID/fallback password: edit $CONF_DST (then toggle the AP off/on, or: svc -t /service/hostapd)"
     logMessage "Toggle the AP in the UI: Settings > Wi-Fi > Create access point"
@@ -156,6 +171,12 @@ fi
 # --- UNINSTALL ---------------------------------------------------------------
 if [ $scriptAction == 'UNINSTALL' ] ; then
     logMessage "uninstalling VenusOS-WiFiAP"
+
+    # Remember whether the AP was on, for the next install
+    was="$(dbus -y com.victronenergy.settings /Settings/Services/AccessPoint GetValue 2>/dev/null)"
+    case "$was" in
+        0|1) mkdir -p "$INSTALL_DIR"; echo "$was" > "$AP_STATE" ;;
+    esac
 
     # Disable the AP first: venus-platform removes /service/hostapd via svectl -r
     dbus -y com.victronenergy.settings /Settings/Services/AccessPoint SetValue 0 2>/dev/null || true
